@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MarketLens AI - Stock Probability, Sentiment & Macro</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="#/home">
+        <span class="brand-mark"></span>
+        <span>
+          <strong>MarketLens AI</strong>
+          <small>The probability <em>of tomorrow.</em></small>
+        </span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#/home">Home</a>
+        <a href="#/" data-protected-nav>Dashboard</a>
+        <a href="#/sentiment" data-protected-nav>Sentiment</a>
+        <a href="#/macro" data-protected-nav>Macro</a>
+        <a href="#/news" data-protected-nav>News</a>
+        <a href="#/paper" data-protected-nav>Paper Trading</a>
+        <a href="#/world-chat" data-protected-nav>World Chat</a>
+        <a href="#/login" id="account-link">Log in</a>
+        <button class="settings-button" id="settings-open" type="button" aria-label="Open settings" title="Settings" data-protected-nav>&#9881;</button>
+      </nav>
+    </header>
+
+    <main id="app"></main>
+
+    <button class="assistant-button" type="button" title="Open AI assistant" data-protected-nav>AI</button>
+    <footer>Market data provided by Finnhub. Yahoo Finance is used as a historical-data fallback when Finnhub is unavailable. Charts use the MarketLens canvas renderer. For educational and informational purposes only. Not financial advice.</footer>
+    <script type="module" src="./firebase-client.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
