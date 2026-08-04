@@ -417,16 +417,18 @@ button.active { background: rgba(54, 211, 153, 0.16); border-color: rgba(54, 211
 .table th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
 
 .assistant-button {
-  position: fixed;
-  right: 18px;
-  bottom: 18px;
-  width: 48px;
-  height: 48px;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  padding: 0;
   border-radius: 50%;
   background: var(--green);
   color: #04130e;
+  border-color: rgba(54, 211, 153, .55);
   font-weight: 900;
-  box-shadow: 0 14px 36px rgba(54, 211, 153, 0.26);
+  font-size: 12px;
+  box-shadow: 0 10px 24px rgba(54, 211, 153, 0.2);
 }
 
 .modal.hidden { display: none; }

@@ -838,7 +838,7 @@ function dashboard() {
         <h2>${s.name}<span class="muted"> ${ticker}</span></h2>
         <div class="quote-price">${fmt(s.price)}</div>
         <p class="${s.change >= 0 ? "green" : "red"}">${s.change >= 0 ? "+" : ""}${s.change.toFixed(2)} (${pct(s.pct)})</p>
-        <p class="subtle section">Finnhub market snapshot for ${ticker}. Quote and profile fields are returned by the backend Finnhub integration.</p>
+        <p class="subtle section">${escapeHtml(quoteProvider)} market snapshot for ${ticker}. Quote and profile fields are returned by the backend data service.</p>
         <p class="subtle data-diagnostics">${escapeHtml(diagnosticSummary)}</p>
         <div class="stat-grid">
           ${[["Open", fmt(s.open)], ["High", fmt(s.high)], ["Low", fmt(s.low)], ["Prev Close", fmt(s.prev)], ["Day Range", `${fmt(s.low)} - ${fmt(s.high)}`], ["52W Range", s.weekLow && s.weekHigh ? `${fmt(s.weekLow)} - ${fmt(s.weekHigh)}` : "N/A"], ["Volume", compactNumber(s.volume)], ["Market Cap", s.type === "CRYPTO" ? "N/A" : marketCapLabel(s.marketCap)]].map(([k,v]) => `<div class="stat"><div class="metric">${k}</div><strong>${v}</strong></div>`).join("")}
@@ -913,7 +913,7 @@ function dashboard() {
 
     <section class="grid cols-2 section">
       <div class="card clickable" data-detail="fundamentals">
-        <h3>Fundamentals &amp; Trend</h3><p class="subtle">Finnhub classification, fundamentals, and price-derived trend indicators</p>
+        <h3>Fundamentals &amp; Trend</h3><p class="subtle">Company classification, fundamentals, and price-derived trend indicators</p>
         <div class="grid cols-3 section">
           <div><div class="metric">Sector · ${s.sector}</div><strong class="green">UPTREND · 50%</strong></div>
           <div><div class="metric">Industry</div><strong>${s.industry}</strong></div>
@@ -925,7 +925,7 @@ function dashboard() {
         </div>
       </div>
       <div class="card clickable" data-detail="earnings">
-        <h3>Earnings Reports</h3><p class="subtle">Finnhub reported and estimated quarterly EPS for ${ticker}</p>
+        <h3>Earnings Reports</h3><p class="subtle">Reported and estimated quarterly EPS for ${ticker}</p>
         ${earningsRows.length ? `<div class="earnings-controls toolbar section"><button class="${earningsShowEstimates ? "active" : ""}" data-estimates-toggle>${earningsShowEstimates ? "Hide Estimates" : "Show Estimates"}</button><span class="subtle">${earningsShowEstimates ? "Actual EPS and estimate bars are visible." : "Only actual EPS bars are visible."}</span></div><div class="earnings-legend section"><span class="actual">Actual EPS</span>${earningsShowEstimates ? `<span class="estimate">Estimate</span>` : ""}<strong>${earningsRows.length} quarters</strong></div><canvas id="earnings-chart" class="earnings-chart" aria-label="${ticker} quarterly actual and estimated EPS"></canvas><div class="earnings-values">${earningsRows.slice().reverse().map(row => `<div><span>${escapeHtml(String(row.period || `${row.year || ""} Q${row.quarter || ""}`))}</span><strong>${fmt(Number(row.actual))}${earningsShowEstimates ? ` / ${fmt(Number(row.estimate))}` : ""}</strong><small class="${Number(row.surprise) >= 0 ? "green" : "amber"}">${earningsShowEstimates && Number.isFinite(Number(row.surprise)) ? `${Number(row.surprise) >= 0 ? "+" : ""}${Number(row.surprise).toFixed(2)} surprise` : earningsShowEstimates ? "Estimate unavailable" : "Estimate hidden"}</small></div>`).join("")}</div>` : `<div class="data-empty section"><p>Finnhub did not return earnings records for this symbol.</p></div>`}
       </div>
     </section>
@@ -1021,6 +1021,7 @@ function probabilityPanel(title, subtitle, target, label, targetKind, options = 
   const directionAbove = options ? optionSide === "Buy Call" || optionSide === "Sell Put" : target >= spot;
   const horizons = [["1D",1],["1W",5],["1M",21],["6M",126],["1Y",252]];
   const history = marketData.probabilityCandles[ticker];
+  const historyProvider = history?.provider || "market history";
   const impliedVolatility = gammaExposure.data?.symbol === ticker ? Number(gammaExposure.data.atmImpliedVolatility) : null;
   const estimates = history ? horizons.map(([,days]) => {
     const historical = historicalOutcomeProbability(history, spot, target, days, !options, directionAbove);
@@ -1038,7 +1039,7 @@ function probabilityPanel(title, subtitle, target, label, targetKind, options = 
     <div class="custom-target"><label for="custom-${targetKind}">${options ? "Enter strike price" : "Enter target price"}</label><div><span>$</span><input id="custom-${targetKind}" type="number" min="0.01" step="0.01" value="${target.toFixed(2)}" data-custom-target="${targetKind}"><button class="primary" data-apply-target="${targetKind}">Apply</button></div></div>
     <div class="toolbar">${[-10,-5,0,5,10,20].filter(v => !(!options && v === 0)).map(v => `<button class="${Math.abs(targetPct-v)<.05 ? "active" : ""}" data-target-kind="${targetKind}" data-target-percent="${v}">${v > 0 ? "+" : ""}${v}%</button>`).join("")}${options ? `<button data-reset-target="options">Reset to spot</button>` : ""}</div>
     <div class="metric">${label} ${fmt(target)}</div>
-    ${chances ? `<div class="stack section">${horizons.map(([h],i) => `<div class="progress-row"><strong>${h}</strong><div class="bar"><span style="width:${chances[i]}%"></span></div><span>${chances[i]}%</span></div>`).join("")}</div><p class="subtle section">${options ? `Estimated probability of finishing beyond the strike. It blends 5 years of Yahoo Finance outcomes with ${Number.isFinite(impliedVolatility) ? `${(impliedVolatility*100).toFixed(1)}% near-money option IV` : "historical outcomes because option IV is unavailable"}.` : "Estimated probability of touching the target, measured from rolling outcomes in 5 years of Yahoo Finance daily history."} Recency-weighted · at least ${Number.isFinite(sampleCount) ? sampleCount.toLocaleString() : "available"} observations. This is a statistical estimate, not an AI forecast or guarantee.${options ? " Premiums, spreads, dividends, early exercise, and IV skew are not included." : ""}</p>` : `<div class="data-empty section"><p>Probability unavailable because Yahoo Finance did not return enough daily history for this symbol.</p></div>`}
+    ${chances ? `<div class="stack section">${horizons.map(([h],i) => `<div class="progress-row"><strong>${h}</strong><div class="bar"><span style="width:${chances[i]}%"></span></div><span>${chances[i]}%</span></div>`).join("")}</div><p class="subtle section">${options ? `Estimated probability of finishing beyond the strike. It blends 5 years of ${escapeHtml(historyProvider)} outcomes with ${Number.isFinite(impliedVolatility) ? `${(impliedVolatility*100).toFixed(1)}% near-money option IV` : "historical outcomes because option IV is unavailable"}.` : `Estimated probability of touching the target, measured from rolling outcomes in 5 years of ${escapeHtml(historyProvider)}.`} Recency-weighted · at least ${Number.isFinite(sampleCount) ? sampleCount.toLocaleString() : "available"} observations. This is a statistical estimate, not an AI forecast or guarantee.${options ? " Premiums, spreads, dividends, early exercise, and IV skew are not included." : ""}</p>` : `<div class="data-empty section"><p>Probability unavailable because market history did not return enough daily observations for this symbol.</p></div>`}
   </div>`;
 }
 
@@ -1064,15 +1065,17 @@ function sentiment() {
     ["Safe Haven Demand", data.safe_haven_demand]
   ].filter(([, value]) => Number.isFinite(Number(value?.score)));
   const updated = current.timestamp || data.fetchedAt;
+  const sentimentProvider = data.provider || "CNN Fear & Greed Index";
+  const fallbackNotice = /demo fallback/i.test(sentimentProvider) ? "Offline fallback values are shown because the live CNN feed is unavailable." : "Values are cached for five minutes; no synthetic sentiment values are shown.";
   pageShell("CNN Fear & Greed Index", `Broad U.S. market sentiment · Updated ${updated ? new Date(updated).toLocaleString() : "recently"}`, `
     <section class="grid cols-3">
       <div class="card probability"><div><div class="metric">Right now</div><strong>${score}</strong><p class="${scoreClass}">${escapeHtml(rating)}</p></div></div>
       <div class="card stack">${previous.map(([label, value]) => `<div class="row"><span class="muted">${label}</span><strong>${Number.isFinite(Number(value)) ? Math.round(Number(value)) : "N/A"}</strong></div>`).join("")}</div>
-      <div class="card"><div class="metric">Scale</div><div class="value">0–100</div><p class="subtle">0 = extreme fear · 100 = extreme greed</p><p class="subtle section">Source: CNN</p></div>
+      <div class="card"><div class="metric">Scale</div><div class="value">0–100</div><p class="subtle">0 = extreme fear · 100 = extreme greed</p><p class="subtle section">Source: ${escapeHtml(sentimentProvider)}</p></div>
     </section>
     <section class="card section"><h2>Seven components</h2><div class="sentiment-components section">${components.map(([label, value]) => { const componentScore = Math.max(0, Math.min(100, Number(value.score))); return `<div><div class="row"><span>${label}</span><strong>${Math.round(componentScore)}</strong></div><div class="bar"><span style="width:${componentScore}%"></span></div><p class="muted">${escapeHtml(String(value.rating || ""))}</p></div>`; }).join("")}</div></section>
     <section class="card sentiment-history section"><h2>6-month history</h2><canvas id="sentiment-chart" aria-label="CNN Fear and Greed six month history"></canvas></section>
-    <p class="subtle section">Source: CNN Fear &amp; Greed Index. Values are cached for five minutes; no synthetic sentiment values are shown.</p>`);
+    <p class="subtle section">Source: ${escapeHtml(sentimentProvider)}. ${escapeHtml(fallbackNotice)}</p>`);
 }
 
 function macroResearchSections(last) {
@@ -1096,6 +1099,7 @@ function macro() {
     : [];
   const sectorMax = Math.max(1, ...sectorRows.map(row => Math.abs(Number(row[sectorRange]))).filter(Number.isFinite));
   const sectorLabels = { oneMonth: "1M", threeMonth: "3M", sixMonth: "6M", ytd: "YTD" };
+  const sectorProvider = marketData.macro.sectors?.provider || "market history";
   const indicatorCard = (id, fallbackTitle, sourceLabel) => {
     const series = indicators[id];
     if (!series?.rows?.length) return `<section class="card macro-indicator-card"><h2>${fallbackTitle}</h2><div class="data-empty section"><p>${escapeHtml(marketData.macro.loading ? "Loading official FRED observations..." : marketData.macro.error || "This FRED series is unavailable.")}</p></div></section>`;
@@ -1110,7 +1114,7 @@ function macro() {
   pageShell("Macro", "Official FRED economic indicators and market-index context", `
     <section class="grid cols-2 macro-indicator-grid">${indicatorCard("unemployment", "Unemployment Rate", "UNRATE")}${indicatorCard("inflation", "Inflation (CPI YoY)", "CPIAUCSL")}${indicatorCard("fed", "Fed Funds Rate", "FEDFUNDS")}${indicatorCard("treasury", "10-Year Treasury Yield", "DGS10")}</section>
     <section class="card sp500-card"><div class="sp500-head"><div><h2>S&amp;P 500 Index vs Moving Averages</h2><p class="subtle">^GSPC · ${spRange} · ${marketData.spLoading ? "Loading market history" : marketData.spCandles ? escapeHtml(marketData.spCandles.provider || "Finnhub") : marketData.spError || "History unavailable"}</p></div><div class="sp500-controls"><div class="pill-list">${comparison("50-day",sma50)}${comparison("200-day",sma200)}</div><div class="segmented">${["6M","1Y","2Y","5Y","10Y"].map(range => `<button class="${active(range,spRange)}" data-sp-range="${range}">${range}</button>`).join("")}</div></div></div>${marketData.spCandles ? `<canvas id="macro-chart" class="sp500-chart section" aria-label="S&P 500 history with moving averages from ${escapeHtml(marketData.spCandles.provider || "Finnhub")}"></canvas>` : `<div class="data-empty section"><p>${escapeHtml(marketData.spLoading ? "Requesting index candles..." : marketData.spError || "Index candles are unavailable from Finnhub and Yahoo Finance.")}</p></div>`}<div class="grid cols-3 sp500-metrics section"><div><div class="metric">Last</div><strong>${Number.isFinite(last)?last.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div><div><div class="metric">SMA 50</div><strong>${Number.isFinite(sma50)?sma50.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div><div><div class="metric">SMA 200</div><strong>${Number.isFinite(sma200)?sma200.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div></div></section>
-    <section class="card sector-etf-card"><div class="sector-etf-head"><div><h2>Sector ETF Performance</h2><p class="subtle">S&amp;P 500 Select Sector SPDR ETFs · Yahoo Finance market history</p></div><div class="segmented">${Object.entries(sectorLabels).map(([key,label]) => `<button class="${active(key,sectorRange)}" data-sector-range="${key}">${label}</button>`).join("")}</div></div>${sectorRows.length ? `<div class="sector-etf-list section">${sectorRows.map(row => { const value=Number(row[sectorRange]); return `<div class="sector-etf-row"><strong>${escapeHtml(row.symbol)}</strong><span>${escapeHtml(row.name)}</span><div class="sector-bar"><i class="${value >= 0 ? "positive" : "negative"}" style="width:${Math.max(2,Math.abs(value)/sectorMax*100)}%"></i></div><b class="${value >= 0 ? "green" : "red"}">${value >= 0 ? "+" : ""}${value.toFixed(2)}%</b></div>`; }).join("")}</div><p class="subtle section">Source: ${escapeHtml(marketData.macro.sectors.provider)} · Updated ${new Date(marketData.macro.sectors.fetchedAt).toLocaleString()}</p>` : `<div class="data-empty section"><p>${escapeHtml(marketData.macro.loading ? "Loading sector ETF history..." : marketData.macro.sectorError || "Sector ETF performance is unavailable.")}</p></div>`}</section>
+    <section class="card sector-etf-card"><div class="sector-etf-head"><div><h2>Sector ETF Performance</h2><p class="subtle">S&amp;P 500 Select Sector SPDR ETFs · ${escapeHtml(sectorProvider)}</p></div><div class="segmented">${Object.entries(sectorLabels).map(([key,label]) => `<button class="${active(key,sectorRange)}" data-sector-range="${key}">${label}</button>`).join("")}</div></div>${sectorRows.length ? `<div class="sector-etf-list section">${sectorRows.map(row => { const value=Number(row[sectorRange]); return `<div class="sector-etf-row"><strong>${escapeHtml(row.symbol)}</strong><span>${escapeHtml(row.name)}</span><div class="sector-bar"><i class="${value >= 0 ? "positive" : "negative"}" style="width:${Math.max(2,Math.abs(value)/sectorMax*100)}%"></i></div><b class="${value >= 0 ? "green" : "red"}">${value >= 0 ? "+" : ""}${value.toFixed(2)}%</b></div>`; }).join("")}</div><p class="subtle section">Source: ${escapeHtml(marketData.macro.sectors.provider)} · Updated ${new Date(marketData.macro.sectors.fetchedAt).toLocaleString()}</p>` : `<div class="data-empty section"><p>${escapeHtml(marketData.macro.loading ? "Loading sector ETF history..." : marketData.macro.sectorError || "Sector ETF performance is unavailable.")}</p></div>`}</section>
     ${macroResearchSections(last)}
     <p class="subtle section">Economic data: Federal Reserve Bank of St. Louis (FRED). CPI inflation is calculated as the year-over-year percentage change in CPIAUCSL. Latest observations may be revised by their source.</p>`);
   bindMacro();
@@ -1711,7 +1715,7 @@ function assistantReply(rawMessage) {
     answer = `Because the last read was driven by these inputs: ${maLine} ${probabilityLine} The stronger pieces are ${bullish.join(", ") || "limited right now"}; the caution points are ${bearish.join(", ") || "mostly muted"}.`;
   } else if (/data|api|provider|live|delay|stale|key|token/.test(lower)) {
     lastAssistantTopic = "data";
-    answer = `${dataLine} Quotes and streaming updates use Finnhub first through the backend. Historical OHLC candles and volume fall back to Yahoo Finance when Finnhub is unavailable. The app never generates substitute market prices.`;
+    answer = `${dataLine} Quotes and streaming updates use Finnhub first through the backend. Historical OHLC candles and volume fall back to Yahoo Finance when Finnhub is unavailable. If every live provider is unreachable, the app marks temporary offline demo data clearly so the interface stays usable.`;
   } else if (/earn|eps|revenue|fundamental|pe|p\/e/.test(lower) || message === "Earnings Summary") {
     lastAssistantTopic = "earnings";
     answer = `${fundamentalLine} In the Earnings Reports panel, use Revenue/EPS plus Show/Hide Estimates to separate actuals from forward estimates. I would compare EPS trend against revenue trend: EPS rising faster than revenue can mean margin expansion, while revenue rising faster than EPS can mean cost pressure.`;

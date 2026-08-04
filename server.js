@@ -53,6 +53,157 @@ function validSymbol(value) {
   return /^[A-Z0-9.^-]{1,12}$/.test(symbol) ? symbol : null;
 }
 
+function usablePayload(value) {
+  return value && !value.unavailable;
+}
+
+function symbolSeed(symbol) {
+  return String(symbol || "AAPL").split("").reduce((sum, char, index) => sum + char.charCodeAt(0) * (index + 11), 0);
+}
+
+function demoBasePrice(symbol) {
+  const known = { AAPL: 212.41, MSFT: 501.48, NVDA: 164.92, TSLA: 315.35, AMZN: 224.83, META: 728.56, GOOGL: 196.52, SPY: 628.86, QQQ: 556.42, "^GSPC": 6299.19 };
+  return known[symbol] || 35 + (symbolSeed(symbol) % 460);
+}
+
+function demoCandles(symbol, range = "6M") {
+  const window = candleWindow(range);
+  const base = demoBasePrice(symbol);
+  const count = ({ "1D": 78, "5D": 130, "1M": 160, "6M": 500, YTD: 520, "1Y": 640, "5Y": 1480, "10Y": 2760 })[range] || 500;
+  const step = ["1D", "5D"].includes(range) ? Number(window.resolution) * 60 : 86400;
+  const seed = symbolSeed(symbol);
+  let close = base * (0.78 + (seed % 29) / 100);
+  const t = [], o = [], h = [], l = [], c = [], v = [];
+  const now = Math.floor(Date.now() / 1000);
+  for (let index = count - 1; index >= 0; index--) {
+    const timestamp = now - index * step;
+    const date = new Date(timestamp * 1000);
+    if (step >= 86400 && (date.getUTCDay() === 0 || date.getUTCDay() === 6)) continue;
+    const wave = Math.sin((count - index + seed) / 17) * 0.012 + Math.cos((count - index + seed) / 41) * 0.007;
+    const drift = 0.00055 + ((seed % 13) - 6) / 100000;
+    const open = close;
+    close = Math.max(2, close * (1 + drift + wave));
+    const spread = Math.max(base * 0.003, Math.abs(close - open) * 1.4);
+    t.push(timestamp);
+    o.push(Number(open.toFixed(2)));
+    c.push(Number(close.toFixed(2)));
+    h.push(Number((Math.max(open, close) + spread).toFixed(2)));
+    l.push(Number((Math.min(open, close) - spread).toFixed(2)));
+    v.push(Math.round((2_000_000 + (seed % 80) * 100_000) * (1 + Math.abs(wave) * 12)));
+  }
+  return { s: "ok", symbol, range, displayFrom: window.displayFrom, resolution: window.resolution, provider: "Demo fallback (offline)", fetchedAt: new Date().toISOString(), t, o, h, l, c, v };
+}
+
+function demoQuote(symbol, candles = demoCandles(symbol, "6M")) {
+  const closes = Array.isArray(candles?.c) ? candles.c.map(Number).filter(Number.isFinite) : [];
+  const current = closes.at(-1) || demoBasePrice(symbol);
+  const previous = closes.at(-2) || current * 0.995;
+  return { c: current, d: current - previous, dp: (current / previous - 1) * 100, h: current * 1.012, l: current * 0.988, o: previous, pc: previous, provider: "Demo fallback (offline)" };
+}
+
+function demoProfile(symbol) {
+  const names = { AAPL: "Apple Inc.", MSFT: "Microsoft Corp.", NVDA: "NVIDIA Corp.", TSLA: "Tesla Inc.", AMZN: "Amazon.com Inc.", META: "Meta Platforms Inc.", GOOGL: "Alphabet Inc.", SPY: "SPDR S&P 500 ETF Trust", QQQ: "Invesco QQQ Trust", "^GSPC": "S&P 500 Index" };
+  return { name: names[symbol] || `${symbol} Holdings`, exchange: symbol.startsWith("^") ? "INDEX" : "NASDAQ", finnhubIndustry: symbol.startsWith("^") ? "Market Index" : "Technology", marketCapitalization: 100000 + (symbolSeed(symbol) % 2500000), shareOutstanding: 1000 + (symbolSeed(symbol) % 12000) };
+}
+
+function demoMetrics(symbol) {
+  const seed = symbolSeed(symbol);
+  return { metric: { epsTTM: 2 + (seed % 1800) / 100, epsGrowth5Y: -4 + (seed % 2600) / 100, peTTM: 12 + (seed % 3200) / 100, revenuePerShareTTM: 15 + (seed % 8000) / 100, "52WeekHigh": demoBasePrice(symbol) * 1.22, "52WeekLow": demoBasePrice(symbol) * 0.72 } };
+}
+
+function demoEarnings(symbol) {
+  const seed = symbolSeed(symbol);
+  return Array.from({ length: 8 }, (_, index) => {
+    const quarterIndex = 7 - index;
+    const date = new Date();
+    date.setMonth(date.getMonth() - quarterIndex * 3);
+    const quarter = Math.floor(date.getMonth() / 3) + 1;
+    const actual = 1 + (seed % 220) / 100 + index * 0.08;
+    const estimate = actual - 0.05 + ((index % 3) - 1) * 0.03;
+    return { symbol, year: date.getFullYear(), quarter, period: `${date.getFullYear()} Q${quarter}`, actual, estimate, surprise: actual - estimate };
+  }).reverse();
+}
+
+function demoNews(symbol) {
+  const today = Math.floor(Date.now() / 1000);
+  return [
+    { id: `${symbol}-demo-1`, datetime: today - 3600, headline: `${symbol} market update: price action and macro conditions in focus`, source: "MarketLens demo", url: "#", summary: "Offline fallback story shown while live company headlines are unavailable." },
+    { id: `${symbol}-demo-2`, datetime: today - 10800, headline: `${symbol} traders watch earnings estimates and volume trend`, source: "MarketLens demo", url: "#", summary: "Use live provider data when connected; this keeps the news panel populated offline." }
+  ];
+}
+
+function demoMacroRows(startYear, endYear, base, amplitude, trend = 0) {
+  const rows = [];
+  const now = new Date();
+  for (let year = startYear; year <= endYear; year++) {
+    for (let month = 0; month < 12; month++) {
+      if (year === now.getFullYear() && month > now.getMonth()) break;
+      const index = (year - startYear) * 12 + month;
+      const value = Math.max(0, base + Math.sin(index / 11) * amplitude + Math.cos(index / 29) * amplitude * 0.45 + trend * index);
+      rows.push({ date: `${year}-${String(month + 1).padStart(2, "0")}-01`, value: Number(value.toFixed(2)) });
+    }
+  }
+  return rows;
+}
+
+function demoMacroIndicators() {
+  const endYear = new Date().getFullYear();
+  const unemploymentRows = demoMacroRows(1985, endYear, 5.1, 1.1, -0.001);
+  unemploymentRows.push({ date: "2020-04-01", value: 14.7 });
+  unemploymentRows.sort((a, b) => a.date.localeCompare(b.date));
+  const inflationRows = demoMacroRows(1985, endYear, 3.1, 1.4, 0.0005);
+  const fedRows = demoMacroRows(1985, endYear, 3.8, 2.1, -0.0015);
+  const treasuryRows = demoMacroRows(1985, endYear, 4.6, 1.3, -0.001);
+  return { provider: "Demo fallback (offline)", fetchedAt: new Date().toISOString(), series: {
+    unemployment: macroSeriesSummary("UNRATE", "Unemployment Rate", "Monthly", "%", unemploymentRows),
+    inflation: macroSeriesSummary("CPIAUCSL", "Inflation (CPI YoY)", "Monthly, year-over-year", "%", inflationRows),
+    fed: macroSeriesSummary("FEDFUNDS", "Fed Funds Rate", "Monthly average", "%", fedRows),
+    treasury: macroSeriesSummary("DGS10", "10-Year Treasury Yield", "Daily", "%", treasuryRows)
+  } };
+}
+
+function demoCnnFearGreed() {
+  const score = 54;
+  const history = Array.from({ length: 190 }, (_, index) => ({ x: Date.now() - (189 - index) * 86400000, y: Math.max(5, Math.min(95, 48 + Math.sin(index / 12) * 17 + Math.cos(index / 31) * 8)) }));
+  return { provider: "Demo fallback (offline)", fetchedAt: new Date().toISOString(), fear_and_greed: { score, rating: "Neutral", previous_close: 52, previous_1_week: 49, previous_1_month: 57, previous_1_year: 45 }, fear_and_greed_historical: { data: history }, market_momentum_sp500: { score: 58, rating: "Neutral" }, stock_price_strength: { score: 55, rating: "Neutral" }, stock_price_breadth: { score: 51, rating: "Neutral" }, put_call_options: { score: 47, rating: "Neutral" }, market_volatility_vix: { score: 62, rating: "Greed" }, junk_bond_demand: { score: 53, rating: "Neutral" }, safe_haven_demand: { score: 49, rating: "Neutral" } };
+}
+
+function demoSectorEtfPerformance() {
+  const sectors = [
+    ["XLK", "Technology"], ["XLC", "Communication Services"], ["XLY", "Consumer Discretionary"],
+    ["XLF", "Financials"], ["XLI", "Industrials"], ["XLE", "Energy"],
+    ["XLV", "Health Care"], ["XLP", "Consumer Staples"], ["XLU", "Utilities"],
+    ["XLB", "Materials"], ["XLRE", "Real Estate"]
+  ];
+  return { provider: "Demo fallback (offline)", fetchedAt: new Date().toISOString(), sectors: sectors.map(([symbol, name], index) => {
+    const seed = symbolSeed(symbol);
+    return { symbol, name, price: demoBasePrice(symbol), oneMonth: -4 + (seed % 900) / 100, threeMonth: -8 + ((seed + index * 41) % 1600) / 100, sixMonth: -12 + ((seed + index * 73) % 2600) / 100, ytd: -15 + ((seed + index * 109) % 3400) / 100 };
+  }) };
+}
+
+function demoGamma(symbol, requestedDte = 30) {
+  const spot = demoBasePrice(symbol);
+  const expiration = new Date(Date.now() + requestedDte * 86400000).toISOString().slice(0, 10);
+  const payload = { strike: [], side: [], openInterest: [], gamma: [], iv: [], dte: [], expiration: [], underlyingPrice: [] };
+  for (let offset = -10; offset <= 10; offset++) {
+    const strike = Math.max(1, spot * (1 + offset * 0.015));
+    ["call", "put"].forEach(side => {
+      const distance = Math.abs(strike / spot - 1);
+      const iv = 0.22 + distance * 1.8;
+      const gamma = blackScholesGamma(spot, strike, iv, requestedDte / 365);
+      payload.strike.push(Number(strike.toFixed(2)));
+      payload.side.push(side);
+      payload.openInterest.push(Math.round(250 + (11 - Math.abs(offset)) * 220 + (side === "put" ? 80 : 0)));
+      payload.gamma.push(gamma || 0.001);
+      payload.iv.push(iv);
+      payload.dte.push(requestedDte);
+      payload.expiration.push(expiration);
+      payload.underlyingPrice.push(spot);
+    });
+  }
+  return summarizeGammaChain(payload, symbol, requestedDte, "Demo fallback (offline)");
+}
+
 function readJsonBody(req, limit = 50000) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -409,6 +560,10 @@ async function handleFinnhubStock(req, res, requestUrl) {
       dataDiagnostics.push({ provider: "Yahoo Finance fallback", ok: false, authApplied: false, message: error.message });
     }
   }
+  if (!candles || candles.unavailable || candles.s !== "ok") {
+    candles = demoCandles(symbol, range);
+    dataDiagnostics.push({ provider: "Demo fallback", ok: true, authApplied: false, message: "Offline chart data returned because live providers were unavailable" });
+  }
   const finnhubQuoteOk = !quote?.unavailable && Number(quote?.c) > 0;
   if (!finnhubQuoteOk) {
     try {
@@ -418,11 +573,13 @@ async function handleFinnhubStock(req, res, requestUrl) {
       dataDiagnostics.push({ provider: "Yahoo Finance quote fallback", ok: false, authApplied: false, message: error.message });
     }
   }
+  if (!Number(effectiveQuote?.c)) effectiveQuote = demoQuote(symbol, candles);
+  const effectiveQuoteOk = Number(effectiveQuote?.c) > 0;
   dataDiagnostics.unshift({
     provider: finnhubQuoteOk ? "Finnhub quote" : "Yahoo Finance quote fallback",
-    ok: Number(effectiveQuote?.c) > 0,
+    ok: effectiveQuoteOk,
     authApplied: finnhubQuoteOk && Boolean(process.env.FINNHUB_API_KEY),
-    message: finnhubQuoteOk ? "Current live quote returned" : Number(effectiveQuote?.c) > 0 ? "Quote returned after Finnhub was unavailable" : quote?.message || "Quote unavailable"
+    message: finnhubQuoteOk ? "Current live quote returned" : effectiveQuote?.provider === "Demo fallback (offline)" ? "Offline quote returned because live providers were unavailable" : effectiveQuoteOk ? "Quote returned after Finnhub was unavailable" : quote?.message || "Quote unavailable"
   });
 
   json(res, 200, {
@@ -436,14 +593,14 @@ async function handleFinnhubStock(req, res, requestUrl) {
     candleProvider: candles?.provider || null,
     dataDiagnostics,
     quote: effectiveQuote,
-    profile,
-    metrics,
+    profile: usablePayload(profile) ? profile : demoProfile(symbol),
+    metrics: usablePayload(metrics) ? metrics : demoMetrics(symbol),
     candles,
-    probabilityCandles,
-    earnings,
-    news: Array.isArray(news) ? news.slice(0, 20) : news,
-    sentiment,
-    recommendations
+    probabilityCandles: usablePayload(probabilityCandles) && probabilityCandles.s === "ok" ? probabilityCandles : demoCandles(symbol, "5Y"),
+    earnings: Array.isArray(earnings) ? earnings : demoEarnings(symbol),
+    news: Array.isArray(news) ? news.slice(0, 20) : demoNews(symbol),
+    sentiment: usablePayload(sentiment) ? sentiment : { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 },
+    recommendations: Array.isArray(recommendations) ? recommendations : [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }]
   });
 }
 
@@ -466,7 +623,7 @@ async function handleFinnhubCandles(req, res, requestUrl) {
   try {
     return json(res, 200, await yahooChart(symbol, range, 60000));
   } catch (error) {
-    return json(res, 502, { error: "Historical candle requests failed", detail: error.message, symbol, range, resolution: window.resolution });
+    return json(res, 200, { ...demoCandles(symbol, range), detail: `Live historical candle requests failed: ${error.message}` });
   }
 }
 
@@ -678,15 +835,15 @@ http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url, "http://127.0.0.1");
   if (requestUrl.pathname === "/api/cnn/fear-greed") {
     try { return json(res, 200, await cnnFearGreed()); }
-    catch (error) { return json(res, 502, { error: "CNN Fear & Greed data is unavailable", detail: error.message }); }
+    catch (error) { return json(res, 200, { ...demoCnnFearGreed(), detail: `CNN Fear & Greed unavailable: ${error.message}` }); }
   }
   if (requestUrl.pathname === "/api/macro/indicators") {
     try { return json(res, 200, await macroIndicators()); }
-    catch (error) { return json(res, 502, { error: "FRED macro data is unavailable", detail: error.message }); }
+    catch (error) { return json(res, 200, { ...demoMacroIndicators(), detail: `FRED macro data unavailable: ${error.message}` }); }
   }
   if (requestUrl.pathname === "/api/macro/sector-etfs") {
     try { return json(res, 200, await sectorEtfPerformance()); }
-    catch (error) { return json(res, 502, { error: "Sector ETF data is unavailable", detail: error.message }); }
+    catch (error) { return json(res, 200, { ...demoSectorEtfPerformance(), detail: `Sector ETF data unavailable: ${error.message}` }); }
   }
   if (requestUrl.pathname === "/api/finnhub/status") return json(res, 200, { configured: Boolean(process.env.FINNHUB_API_KEY), provider: "Finnhub" });
   if (requestUrl.pathname === "/api/market-data/status") return json(res, 200, { configured: Boolean(process.env.MARKET_DATA_API_TOKEN), provider: "Market Data" });
@@ -697,7 +854,7 @@ http.createServer(async (req, res) => {
     try { return json(res, 200, await marketDataGamma(symbol, requestedDte)); }
     catch (primaryError) {
       try { return json(res, 200, await yahooGamma(symbol, requestedDte)); }
-      catch (fallbackError) { return json(res, 502, { error: "Gamma exposure is unavailable", detail: `${primaryError.message} Yahoo fallback: ${fallbackError.message}`, symbol }); }
+      catch (fallbackError) { return json(res, 200, { ...demoGamma(symbol, requestedDte), detail: `Live gamma exposure unavailable: ${primaryError.message} Yahoo fallback: ${fallbackError.message}` }); }
     }
   }
   if (requestUrl.pathname === "/api/firebase/config") return json(res, 200, firebasePublicConfig());
