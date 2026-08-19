@@ -52,5 +52,6 @@ Desktop.ini
 # Temporary files
 tmp/
 temp/
+.npm-cache/
 *.tmp
 *.bak
