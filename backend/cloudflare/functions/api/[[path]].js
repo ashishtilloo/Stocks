@@ -90,6 +90,45 @@ async function alphaVantageQuote(env, symbol) {
   };
 }
 
+function firstNumber(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const number = Number(raw);
+  return Number.isFinite(number) ? number : null;
+}
+
+async function marketDataStockQuote(env, symbol) {
+  if (!env.MARKET_DATA_API_TOKEN) throw new Error("MARKET_DATA_API_TOKEN is not configured");
+  if (symbol.startsWith("^")) throw new Error("Market Data stock quotes do not support index symbols");
+  const url = new URL(`https://api.marketdata.app/v1/stocks/quotes/${encodeURIComponent(symbol)}/`);
+  url.searchParams.set("extended", "true");
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${env.MARKET_DATA_API_TOKEN}`
+    }
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok && response.status !== 203) throw new Error(payload.errmsg || `Market Data quote failed (${response.status})`);
+  if (payload.s !== "ok") throw new Error(payload.errmsg || "Market Data returned no quote");
+  const current = firstNumber(payload.last) ?? firstNumber(payload.mid) ?? firstNumber(payload.bid) ?? firstNumber(payload.ask);
+  const change = firstNumber(payload.change);
+  const changePct = firstNumber(payload.changepct);
+  const previous = Number.isFinite(current) && Number.isFinite(change) ? current - change : null;
+  if (!Number.isFinite(current) || current <= 0) throw new Error("Market Data returned no current stock price");
+  return {
+    c: current,
+    d: change,
+    dp: Number.isFinite(changePct) ? changePct * 100 : Number.isFinite(previous) && previous !== 0 ? (current / previous - 1) * 100 : null,
+    h: null,
+    l: null,
+    o: null,
+    pc: previous,
+    t: firstNumber(payload.updated),
+    volume: firstNumber(payload.volume),
+    provider: "Market Data"
+  };
+}
+
 function alphaSeriesKey(data) {
   return Object.keys(data || {}).find(key => /Time Series/i.test(key));
 }
@@ -301,15 +340,21 @@ async function stooqChart(symbol, range, apiKey = "") {
 
 async function marketChart(env, symbol, range) {
   const diagnostics = [];
+  let marketDataQuote = null;
   try {
-    const [candles, rawQuote] = await Promise.all([
-      alphaVantageChart(env, symbol, range),
-      alphaVantageQuote(env, symbol)
-    ]);
+    marketDataQuote = await marketDataStockQuote(env, symbol);
+    diagnostics.push({ provider: "Market Data", ok: true, authApplied: Boolean(env.MARKET_DATA_API_TOKEN), message: "Latest stock quote returned" });
+  } catch (error) {
+    diagnostics.push({ provider: "Market Data", ok: false, authApplied: Boolean(env.MARKET_DATA_API_TOKEN), message: error.message });
+  }
+
+  try {
+    const candles = await alphaVantageChart(env, symbol, range);
+    const rawQuote = marketDataQuote || await alphaVantageQuote(env, symbol);
     if (!Number.isFinite(Number(rawQuote?.c)) || Number(rawQuote.c) <= 0) throw new Error("Alpha Vantage returned candles but no current quote");
-    const quote = { ...rawQuote, provider: "Alpha Vantage" };
-    diagnostics.push({ provider: "Alpha Vantage", ok: true, authApplied: Boolean(alphaVantageKey(env)), message: "Quote, OHLC, and volume returned" });
-    return { candles, quote, diagnostics, provider: "Alpha Vantage" };
+    const quote = { ...rawQuote, provider: rawQuote.provider || "Alpha Vantage" };
+    diagnostics.push({ provider: "Alpha Vantage", ok: true, authApplied: Boolean(alphaVantageKey(env)), message: `${marketDataQuote ? "OHLC and volume returned; Market Data supplied quote" : "Quote, OHLC, and volume returned"}` });
+    return { candles, quote, diagnostics, provider: marketDataQuote ? "Market Data + Alpha Vantage" : "Alpha Vantage" };
   } catch (error) {
     diagnostics.push({ provider: "Alpha Vantage", ok: false, authApplied: Boolean(alphaVantageKey(env)), message: error.message });
   }
@@ -325,15 +370,15 @@ async function marketChart(env, symbol, range) {
   try {
     const candles = await stooqChart(symbol, range, env.STOOQ_API_KEY || "");
     diagnostics.push({ provider: "Stooq", ok: true, authApplied: Boolean(env.STOOQ_API_KEY), message: "Daily OHLC and volume returned" });
-    const quote = googleQuote || chartQuote(candles);
+    const quote = marketDataQuote || googleQuote || chartQuote(candles);
     if (!Number.isFinite(Number(quote?.c))) throw new Error("Stooq returned history but no current quote");
-    return { candles, quote, diagnostics, provider: quote.provider === "Google Finance" ? "Google Finance + Stooq" : "Stooq" };
+    return { candles, quote, diagnostics, provider: quote.provider === "Market Data" ? "Market Data + Stooq" : quote.provider === "Google Finance" ? "Google Finance + Stooq" : "Stooq" };
   } catch (error) {
     diagnostics.push({ provider: "Stooq", ok: false, authApplied: Boolean(env.STOOQ_API_KEY), message: error.message });
   }
 
   const detail = diagnostics.map(item => `${item.provider}: ${item.message}`).join("; ");
-  const unavailable = new Error(`Market data unavailable from Alpha Vantage, Google Finance, and Stooq. ${detail}`);
+  const unavailable = new Error(`Market data unavailable from Market Data, Alpha Vantage, Google Finance, and Stooq. ${detail}`);
   unavailable.diagnostics = diagnostics;
   throw unavailable;
 }
