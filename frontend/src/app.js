@@ -1,3 +1,5 @@
+import { apiEventSource, apiFetch, apiJson } from "./services/api.js";
+
 const initialTheme = localStorage.getItem("marketlens-theme") || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
 const initialUiStyle = ["classic", "terminal", "compact"].includes(localStorage.getItem("marketlens-ui-style")) ? localStorage.getItem("marketlens-ui-style") : "classic";
 let notificationsEnabled = localStorage.getItem("marketlens-notifications") === "true";
@@ -438,8 +440,8 @@ async function refreshTickerData(symbol, rerender = true) {
   marketData.error = "";
   if (rerender && route() === "/") dashboard();
   try {
-    const response = await fetch(`/api/market/stock?symbol=${encodeURIComponent(requested)}&range=${chartRange}`);
-    const payload = await response.json();
+    const response = await apiFetch(`/api/market/stock?symbol=${encodeURIComponent(requested)}&range=${chartRange}`);
+    const payload = await apiJson(response, "Market data");
     if (!response.ok) throw new Error(payload.error || "Market data request failed");
     marketData.configured = true;
     const providerLabel = payload.quoteProvider || payload.quote?.provider || payload.provider || "";
@@ -523,8 +525,8 @@ async function refreshChartData(symbol = ticker, range = chartRange) {
   marketData.error = "";
   if (route() === "/") dashboard();
   try {
-    const response = await fetch(`/api/market/candles?symbol=${encodeURIComponent(requested)}&range=${encodeURIComponent(range)}`);
-    const payload = await response.json();
+    const response = await apiFetch(`/api/market/candles?symbol=${encodeURIComponent(requested)}&range=${encodeURIComponent(range)}`);
+    const payload = await apiJson(response, "Historical candles");
     if (!response.ok) throw new Error(payload.detail || payload.error || "Historical candle request failed");
     marketData.candles[requested] = payload;
   } catch (error) {
@@ -549,7 +551,7 @@ async function refreshWatchlistData({ force = false } = {}) {
 function connectMarketStream(symbol) {
   if (marketEventSource?.datasetSymbol === symbol) return;
   marketEventSource?.close();
-  marketEventSource = new EventSource(`/api/market/stream?symbol=${encodeURIComponent(symbol)}`);
+  marketEventSource = apiEventSource(`/api/market/stream?symbol=${encodeURIComponent(symbol)}`);
   marketEventSource.datasetSymbol = symbol;
   marketEventSource.addEventListener("quote", event => {
     try {
@@ -593,8 +595,8 @@ async function refreshGammaExposure(symbol = gammaExposure.symbol, dte = gammaEx
   const requestId = ++gammaExposure.requestId;
   if (route() === "/") dashboard();
   try {
-    const response = await fetch(`/api/options/gamma?symbol=${encodeURIComponent(requested)}&dte=${gammaExposure.dte}`);
-    const payload = await response.json();
+    const response = await apiFetch(`/api/options/gamma?symbol=${encodeURIComponent(requested)}&dte=${gammaExposure.dte}`);
+    const payload = await apiJson(response, "Gamma exposure");
     if (!response.ok) throw new Error(payload.detail || payload.error || "Options chain request failed");
     if (requestId === gammaExposure.requestId && payload.symbol === requested) gammaExposure.data = payload;
   } catch (error) {
@@ -622,11 +624,15 @@ async function refreshMacroData() {
   try {
     const lookbackRange = "10Y";
     const [response, macroResponse, sectorResponse] = await Promise.all([
-      fetch(`/api/market/stock?symbol=${encodeURIComponent("^GSPC")}&range=${lookbackRange}&interval=Daily`),
-      fetch("/api/macro/indicators"),
-      fetch("/api/macro/sector-etfs")
+      apiFetch(`/api/market/stock?symbol=${encodeURIComponent("^GSPC")}&range=${lookbackRange}&interval=Daily`),
+      apiFetch("/api/macro/indicators"),
+      apiFetch("/api/macro/sector-etfs")
     ]);
-    const [payload, macroPayload, sectorPayload] = await Promise.all([response.json(), macroResponse.json(), sectorResponse.json()]);
+    const [payload, macroPayload, sectorPayload] = await Promise.all([
+      apiJson(response, "S&P 500 market data"),
+      apiJson(macroResponse, "Macro indicators"),
+      apiJson(sectorResponse, "Sector ETF data")
+    ]);
     const normalizedCandles = normalizeSp500Candles(payload.candles);
     if (response.ok && normalizedCandles && normalizedCandles.t.length >= 200) {
       marketData.spCandles = { ...normalizedCandles, displayRange: spRange };
@@ -671,8 +677,8 @@ async function refreshCnnSentiment() {
   marketData.cnn.error = "";
   if (route() === "/sentiment") sentiment();
   try {
-    const response = await fetch("/api/cnn/fear-greed");
-    const payload = await response.json();
+    const response = await apiFetch("/api/cnn/fear-greed");
+    const payload = await apiJson(response, "CNN Fear & Greed");
     if (!response.ok) throw new Error(payload.detail || payload.error || "CNN Fear & Greed request failed");
     marketData.cnn.data = payload;
   } catch (error) {
@@ -1309,14 +1315,14 @@ async function refreshWorldChat() {
   if (route() !== "/world-chat") return;
   clearTimeout(worldChatTimer);
   try {
-    const presenceResponse = await fetch("/api/world-chat/presence", {
+    const presenceResponse = await apiFetch("/api/world-chat/presence", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: worldChatState.sessionId, user: worldChatState.user, channel: worldChatState.channel })
     });
     if (!presenceResponse.ok) throw new Error("Presence unavailable");
-    const response = await fetch(`/api/world-chat/messages?channel=${encodeURIComponent(worldChatState.channel)}`);
-    const payload = await response.json();
+    const response = await apiFetch(`/api/world-chat/messages?channel=${encodeURIComponent(worldChatState.channel)}`);
+    const payload = await apiJson(response, "World Chat messages");
     if (!response.ok) throw new Error(payload.error || "Chat unavailable");
     const incomingMessages = Array.isArray(payload.messages) ? payload.messages : [];
     if (worldChatState.seenMessageIds.size && notificationsEnabled && "Notification" in window && Notification.permission === "granted" && document.hidden) {
@@ -1356,12 +1362,12 @@ async function sendWorldChatMessage() {
   }
   button.disabled = true;
   try {
-    const response = await fetch("/api/world-chat/messages", {
+    const response = await apiFetch("/api/world-chat/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: worldChatState.sessionId, user: worldChatState.user, channel: worldChatState.channel, text })
     });
-    const payload = await response.json();
+    const payload = await apiJson(response, "World Chat message send");
     if (!response.ok) throw new Error(payload.error || "Message failed");
     input.value = "";
     await refreshWorldChat();
@@ -1642,8 +1648,8 @@ async function updateAssistantStatus() {
   const label = document.querySelector(".assistant-model");
   if (!label) return;
   try {
-    const response = await fetch("/api/ai/status");
-    const status = await response.json();
+    const response = await apiFetch("/api/ai/status");
+    const status = await apiJson(response, "AI status");
     label.textContent = status.configured ? "Connected - live market context" : "Market-aware local mode";
     label.classList.toggle("connected", Boolean(status.configured));
   } catch {
@@ -1685,12 +1691,12 @@ async function sendChatMessage(message) {
   let fallbackReason = "";
   const provider = "Market Copilot";
   try {
-    const response = await fetch("/api/ai/chat", {
+    const response = await apiFetch("/api/ai/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: cleanMessage, history: priorHistory, context: compactAssistantContext() })
     });
-    const data = await response.json().catch(() => ({}));
+    const data = await apiJson(response, "AI chat").catch(() => ({}));
     if (data.configured === false) throw new Error("Live AI is not configured for this deployment");
     if (!response.ok || !data.answer) throw new Error(data.error || "AI service unavailable");
     answer = data.answer;

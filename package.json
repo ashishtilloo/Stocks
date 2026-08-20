@@ -2,14 +2,16 @@
   "name": "marketlens-ai",
   "private": true,
   "version": "1.0.0",
-  "type": "commonjs",
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
-    "build": "vite build",
-    "preview": "vite preview --host 127.0.0.1"
-  },
-  "devDependencies": {
-    "vite": "^7.0.0",
-    "wrangler": "4.124.0"
+    "dev": "npm run dev:backend",
+    "dev:backend": "npm run dev --workspace backend",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "build": "npm run build --workspace frontend",
+    "preview": "npm run preview --workspace frontend",
+    "start": "npm run start --workspace backend"
   }
 }

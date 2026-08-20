@@ -5,6 +5,8 @@ node_modules/
 dist/
 build/
 .vite/
+/public/
+/functions/
 
 # Local environment and secrets
 .env
@@ -27,6 +29,7 @@ server.*.log
 .codex/
 outputs/
 work/
+skills-lock.json
 
 # Test and coverage output
 coverage/

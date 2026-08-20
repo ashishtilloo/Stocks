@@ -1,6 +1,10 @@
 {
+  "functions": {
+    "source": "backend/firebase-functions",
+    "runtime": "nodejs20"
+  },
   "hosting": {
-    "public": "dist",
+    "public": "frontend/dist",
     "ignore": [
       "firebase.json",
       "**/.*",
@@ -8,6 +12,13 @@
     ],
     "cleanUrls": true,
     "rewrites": [
+      {
+        "source": "/api/**",
+        "function": {
+          "functionId": "api",
+          "region": "us-central1"
+        }
+      },
       {
         "source": "**",
         "destination": "/index.html"

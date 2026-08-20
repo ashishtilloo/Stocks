@@ -2,7 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const root = __dirname;
+const root = path.resolve(__dirname, "../..");
 const normalizedRoot = path.resolve(root).toLowerCase();
 const envPath = path.join(root, ".env");
 
@@ -1094,7 +1094,8 @@ async function yahooGamma(symbol, requestedDte) {
 }
 
 function serveStatic(req, res) {
-  const staticRoot = fs.existsSync(path.join(root, "dist", "index.html")) ? path.join(root, "dist") : root;
+  const frontendRoot = path.join(root, "frontend");
+  const staticRoot = fs.existsSync(path.join(frontendRoot, "dist", "index.html")) ? path.join(frontendRoot, "dist") : frontendRoot;
   const normalizedStaticRoot = path.resolve(staticRoot).toLowerCase();
   const urlPath = decodeURIComponent(req.url.split("?")[0]);
   if (urlPath.split("/").some(segment => segment.startsWith("."))) {
@@ -1122,6 +1123,10 @@ const port = Number(process.env.PORT) || 4890;
 http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url, "http://127.0.0.1");
   if (requestUrl.pathname === "/api/cnn/fear-greed") {
+    try { return json(res, 200, await cnnFearGreed()); }
+    catch (error) { return json(res, 200, { ...demoCnnFearGreed(), detail: `CNN Fear & Greed unavailable: ${error.message}` }); }
+  }
+  if (requestUrl.pathname === "/api/market/sentiment") {
     try { return json(res, 200, await cnnFearGreed()); }
     catch (error) { return json(res, 200, { ...demoCnnFearGreed(), detail: `CNN Fear & Greed unavailable: ${error.message}` }); }
   }
@@ -1191,11 +1196,11 @@ http.createServer(async (req, res) => {
       return json(res, 400, { error: error.message });
     }
   }
-  if (requestUrl.pathname === "/api/market/stock" || requestUrl.pathname === "/api/finnhub/stock") {
+  if (requestUrl.pathname === "/api/market/stock" || requestUrl.pathname === "/api/market/quote" || requestUrl.pathname === "/api/finnhub/stock") {
     try { return await handleMarketStock(req, res, requestUrl); }
     catch (error) { return json(res, 502, { error: "Market data request failed", detail: error.message }); }
   }
-  if (requestUrl.pathname === "/api/market/candles" || requestUrl.pathname === "/api/finnhub/candles") return handleMarketCandles(req, res, requestUrl);
+  if (requestUrl.pathname === "/api/market/candles" || requestUrl.pathname === "/api/market/history" || requestUrl.pathname === "/api/finnhub/candles") return handleMarketCandles(req, res, requestUrl);
   if (requestUrl.pathname === "/api/market/stream" || requestUrl.pathname === "/api/finnhub/stream") return streamMarketQuotes(req, res, requestUrl);
   serveStatic(req, res);
 }).listen(port, "127.0.0.1", () => {

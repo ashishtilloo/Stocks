@@ -1,3 +1,5 @@
+import { apiFetch, apiJson } from "./services/api.js";
+
 const firebaseState = {
   ready: false,
   configured: false,
@@ -182,8 +184,8 @@ window.marketLensFirebase = {
 
 async function initializeFirebase() {
   try {
-    const response = await fetch("/api/firebase/config");
-    const payload = await response.json();
+    const response = await apiFetch("/api/firebase/config");
+    const payload = await apiJson(response, "Firebase config");
     firebaseState.configured = Boolean(payload.configured);
     if (!firebaseState.configured) {
       firebaseState.mode = "local";
