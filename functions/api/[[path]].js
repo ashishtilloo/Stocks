@@ -31,6 +31,306 @@ function candleWindow(range) {
   return { ...settings, to: now };
 }
 
+function alphaVantageKey(env) {
+  return env.ALPHA_VANTAGE_API_KEY || env.ALPHAVANTAGE_API_KEY;
+}
+
+function alphaVantageSymbol(symbol) {
+  return ({ "^GSPC": "SPY", "^DJI": "DIA", "^IXIC": "QQQ" })[symbol] || symbol;
+}
+
+async function alphaVantage(env, params) {
+  const apiKey = alphaVantageKey(env);
+  if (!apiKey) throw new Error("ALPHA_VANTAGE_API_KEY is not configured");
+  const url = new URL("https://www.alphavantage.co/query");
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, String(value)));
+  url.searchParams.set("apikey", apiKey);
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  const data = await response.json().catch(() => ({}));
+  const providerMessage = data["Error Message"] || data.Note || data.Information;
+  if (!response.ok || providerMessage) throw new Error(providerMessage || `Alpha Vantage request failed (${response.status})`);
+  return data;
+}
+
+function alphaTimestampFromDate(date, intraday = false) {
+  return Math.floor(new Date(intraday ? `${date.replace(" ", "T")}:00Z` : `${date}T16:00:00Z`).getTime() / 1000);
+}
+
+function alphaNumber(row, key) {
+  const value = Number(row?.[key]);
+  return Number.isFinite(value) ? value : null;
+}
+
+async function alphaVantageQuote(env, symbol) {
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const data = await alphaVantage(env, { function: "GLOBAL_QUOTE", symbol: sourceSymbol });
+  const quote = data["Global Quote"] || {};
+  const current = alphaNumber(quote, "05. price");
+  const previous = alphaNumber(quote, "08. previous close");
+  if (!Number.isFinite(current) || current <= 0) throw new Error("Alpha Vantage returned no current quote");
+  const rawPercent = String(quote["10. change percent"] || "").replace("%", "");
+  const latestDay = quote["07. latest trading day"];
+  return {
+    c: current,
+    d: alphaNumber(quote, "09. change"),
+    dp: Number.isFinite(Number(rawPercent)) ? Number(rawPercent) : Number.isFinite(previous) && previous !== 0 ? (current / previous - 1) * 100 : null,
+    h: alphaNumber(quote, "03. high"),
+    l: alphaNumber(quote, "04. low"),
+    o: alphaNumber(quote, "02. open"),
+    pc: previous,
+    t: latestDay ? alphaTimestampFromDate(latestDay) : null,
+    provider: "Alpha Vantage"
+  };
+}
+
+function alphaSeriesKey(data) {
+  return Object.keys(data || {}).find(key => /Time Series/i.test(key));
+}
+
+async function alphaVantageChart(env, symbol, range) {
+  const window = candleWindow(range);
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const intraday = ["1D", "5D", "1M"].includes(range);
+  const interval = ({ "5": "5min", "15": "15min", "60": "60min" })[window.resolution] || "60min";
+  const data = await alphaVantage(env, intraday
+    ? { function: "TIME_SERIES_INTRADAY", symbol: sourceSymbol, interval, outputsize: "full", adjusted: "false" }
+    : { function: "TIME_SERIES_DAILY_ADJUSTED", symbol: sourceSymbol, outputsize: "full" });
+  const series = data[alphaSeriesKey(data)];
+  if (!series || typeof series !== "object") throw new Error("Alpha Vantage returned no chart history");
+  const rows = Object.entries(series).map(([date, row]) => ({
+    time: alphaTimestampFromDate(date, intraday),
+    open: alphaNumber(row, "1. open"),
+    high: alphaNumber(row, "2. high"),
+    low: alphaNumber(row, "3. low"),
+    close: alphaNumber(row, intraday ? "4. close" : "5. adjusted close") ?? alphaNumber(row, "4. close"),
+    volume: alphaNumber(row, intraday ? "5. volume" : "6. volume") ?? 0
+  })).filter(row => row.time >= window.from && row.time <= window.to && [row.time, row.open, row.high, row.low, row.close].every(Number.isFinite))
+    .sort((a, b) => a.time - b.time);
+  if (rows.length < 2) {
+    throw new Error("Alpha Vantage returned insufficient chart history for this range");
+  }
+  return {
+    s: "ok",
+    t: rows.map(row => row.time),
+    o: rows.map(row => row.open),
+    h: rows.map(row => row.high),
+    l: rows.map(row => row.low),
+    c: rows.map(row => row.close),
+    v: rows.map(row => row.volume),
+    meta: { regularMarketPrice: rows.at(-1).close, chartPreviousClose: rows.at(-2).close },
+    symbol,
+    sourceSymbol,
+    range,
+    displayFrom: window.displayFrom,
+    resolution: window.resolution,
+    provider: sourceSymbol === symbol ? "Alpha Vantage" : `Alpha Vantage (${sourceSymbol} proxy)`,
+    fetchedAt: new Date().toISOString()
+  };
+}
+
+function rangeDisplayFrom(range, latestTime) {
+  const latest = Number(latestTime) || Math.floor(Date.now() / 1000);
+  if (range === "YTD") {
+    const date = new Date(latest * 1000);
+    return Math.floor(Date.UTC(date.getUTCFullYear(), 0, 1) / 1000);
+  }
+  const days = ({ "1D": 1, "5D": 5, "1M": 31, "6M": 183, "1Y": 365, "5Y": 365 * 5, "10Y": 365 * 10 })[range] || 183;
+  return latest - days * 86400;
+}
+
+function chartQuote(chart) {
+  const meta = chart?.meta || {};
+  const current = Number(meta.regularMarketPrice ?? chart?.c?.at(-1));
+  const previous = Number(meta.chartPreviousClose ?? meta.previousClose ?? chart?.c?.at(-2));
+  return {
+    c: current,
+    d: Number.isFinite(current) && Number.isFinite(previous) ? current - previous : null,
+    dp: Number.isFinite(current) && Number.isFinite(previous) && previous !== 0 ? (current / previous - 1) * 100 : null,
+    h: Number(meta.regularMarketDayHigh),
+    l: Number(meta.regularMarketDayLow),
+    o: Number(meta.regularMarketOpen),
+    pc: previous,
+    t: Number(meta.regularMarketTime),
+    provider: chart?.provider || "Market data"
+  };
+}
+
+function googleFinanceCandidates(symbol) {
+  const map = {
+    "^GSPC": [".INX:INDEXSP"],
+    "^DJI": [".DJI:INDEXDJX"],
+    "^IXIC": [".IXIC:INDEXNASDAQ"],
+    SPY: ["SPY:NYSEARCA"],
+    QQQ: ["QQQ:NASDAQ"],
+    IWM: ["IWM:NYSEARCA"],
+    DIA: ["DIA:NYSEARCA"]
+  };
+  if (map[symbol]) return map[symbol];
+  const nasdaq = new Set(["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "GOOG", "AMD", "NFLX", "INTC", "COST", "ADBE", "AVGO", "PEP", "CSCO", "CMCSA", "TMUS"]);
+  const exchanges = nasdaq.has(symbol) ? ["NASDAQ", "NYSE", "NYSEARCA"] : ["NYSE", "NASDAQ", "NYSEARCA"];
+  return exchanges.map(exchange => `${symbol}:${exchange}`);
+}
+
+function parseGoogleNumber(value) {
+  const cleaned = String(value || "").replace(/&amp;/g, "&").replace(/[^\d.+-]/g, "");
+  const number = Number(cleaned);
+  return Number.isFinite(number) ? number : null;
+}
+
+async function googleFinanceQuote(symbol) {
+  let lastError = null;
+  for (const candidate of googleFinanceCandidates(symbol)) {
+    try {
+      const encodedCandidate = candidate.split(":").map(encodeURIComponent).join(":");
+      const response = await fetch(`https://www.google.com/finance/quote/${encodedCandidate}`, {
+        headers: {
+          accept: "text/html,application/xhtml+xml",
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+        }
+      });
+      const html = await response.text();
+      if (!response.ok) throw new Error(`Google Finance request failed (${response.status})`);
+      const current = parseGoogleNumber(html.match(/data-last-price="([^"]+)"/)?.[1])
+        ?? parseGoogleNumber(html.match(/class="YMlKec fxKbKc">([^<]+)</)?.[1]);
+      if (!Number.isFinite(current)) throw new Error("Google Finance returned no current price");
+      const previous = parseGoogleNumber(html.match(/data-previous-close="([^"]+)"/)?.[1]);
+      const timestamp = Number(html.match(/data-last-normal-market-timestamp-sec="([^"]+)"/)?.[1]);
+      return {
+        c: current,
+        d: Number.isFinite(previous) ? current - previous : null,
+        dp: Number.isFinite(previous) && previous !== 0 ? (current / previous - 1) * 100 : null,
+        h: null,
+        l: null,
+        o: null,
+        pc: Number.isFinite(previous) ? previous : null,
+        t: Number.isFinite(timestamp) ? timestamp : null,
+        provider: "Google Finance"
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(lastError?.message || "Google Finance quote unavailable");
+}
+
+function yyyymmdd(timestamp) {
+  const date = new Date(Number(timestamp) * 1000);
+  return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, "0")}${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+function stooqSymbol(symbol) {
+  const map = { "^GSPC": "^spx", "^DJI": "^dji", "^IXIC": "^ndq", SPY: "spy.us", QQQ: "qqq.us" };
+  if (map[symbol]) return map[symbol];
+  if (symbol.startsWith("^")) return symbol.toLowerCase();
+  return symbol.includes(".") ? symbol.toLowerCase() : `${symbol.toLowerCase()}.us`;
+}
+
+function parseCsvLine(line) {
+  const fields = [];
+  let field = "";
+  let quoted = false;
+  for (const char of String(line || "")) {
+    if (char === "\"") quoted = !quoted;
+    else if (char === "," && !quoted) {
+      fields.push(field);
+      field = "";
+    } else {
+      field += char;
+    }
+  }
+  fields.push(field);
+  return fields.map(value => value.trim().replace(/^"|"$/g, ""));
+}
+
+async function stooqChart(symbol, range, apiKey = "") {
+  const window = candleWindow(range);
+  const url = new URL("https://stooq.com/q/d/l/");
+  url.searchParams.set("s", stooqSymbol(symbol));
+  url.searchParams.set("d1", yyyymmdd(window.from));
+  url.searchParams.set("d2", yyyymmdd(window.to));
+  url.searchParams.set("i", "d");
+  if (apiKey) url.searchParams.set("apikey", apiKey);
+  const response = await fetch(url, {
+    headers: {
+      accept: "text/csv",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+    }
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Stooq request failed (${response.status})`);
+  if (/apikey|captcha|exceeded|no data/i.test(text)) throw new Error("Stooq did not return usable chart data");
+  const lines = text.trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 3) throw new Error("Stooq returned insufficient chart history");
+  const rows = lines.slice(1).map(line => {
+    const [date, open, high, low, close, volume] = parseCsvLine(line);
+    return {
+      time: Math.floor(new Date(`${date}T16:00:00Z`).getTime() / 1000),
+      open: Number(open),
+      high: Number(high),
+      low: Number(low),
+      close: Number(close),
+      volume: Number(volume) || 0
+    };
+  }).filter(row => [row.time, row.open, row.high, row.low, row.close].every(Number.isFinite));
+  if (rows.length < 2) throw new Error("Stooq returned insufficient valid OHLC rows");
+  const latestTime = rows.at(-1).time;
+  return {
+    s: "ok",
+    t: rows.map(row => row.time),
+    o: rows.map(row => row.open),
+    h: rows.map(row => row.high),
+    l: rows.map(row => row.low),
+    c: rows.map(row => row.close),
+    v: rows.map(row => row.volume),
+    meta: { regularMarketPrice: rows.at(-1).close, chartPreviousClose: rows.at(-2).close },
+    symbol,
+    range,
+    displayFrom: rangeDisplayFrom(range, latestTime),
+    resolution: "D",
+    provider: "Stooq",
+    fetchedAt: new Date().toISOString()
+  };
+}
+
+async function marketChart(env, symbol, range) {
+  const diagnostics = [];
+  try {
+    const [candles, rawQuote] = await Promise.all([
+      alphaVantageChart(env, symbol, range),
+      alphaVantageQuote(env, symbol)
+    ]);
+    if (!Number.isFinite(Number(rawQuote?.c)) || Number(rawQuote.c) <= 0) throw new Error("Alpha Vantage returned candles but no current quote");
+    const quote = { ...rawQuote, provider: "Alpha Vantage" };
+    diagnostics.push({ provider: "Alpha Vantage", ok: true, authApplied: Boolean(alphaVantageKey(env)), message: "Quote, OHLC, and volume returned" });
+    return { candles, quote, diagnostics, provider: "Alpha Vantage" };
+  } catch (error) {
+    diagnostics.push({ provider: "Alpha Vantage", ok: false, authApplied: Boolean(alphaVantageKey(env)), message: error.message });
+  }
+
+  let googleQuote = null;
+  try {
+    googleQuote = await googleFinanceQuote(symbol);
+    diagnostics.push({ provider: "Google Finance", ok: true, authApplied: false, message: "Current quote returned" });
+  } catch (error) {
+    diagnostics.push({ provider: "Google Finance", ok: false, authApplied: false, message: error.message });
+  }
+
+  try {
+    const candles = await stooqChart(symbol, range, env.STOOQ_API_KEY || "");
+    diagnostics.push({ provider: "Stooq", ok: true, authApplied: Boolean(env.STOOQ_API_KEY), message: "Daily OHLC and volume returned" });
+    const quote = googleQuote || chartQuote(candles);
+    if (!Number.isFinite(Number(quote?.c))) throw new Error("Stooq returned history but no current quote");
+    return { candles, quote, diagnostics, provider: quote.provider === "Google Finance" ? "Google Finance + Stooq" : "Stooq" };
+  } catch (error) {
+    diagnostics.push({ provider: "Stooq", ok: false, authApplied: Boolean(env.STOOQ_API_KEY), message: error.message });
+  }
+
+  const detail = diagnostics.map(item => `${item.provider}: ${item.message}`).join("; ");
+  const unavailable = new Error(`Market data unavailable from Alpha Vantage, Google Finance, and Stooq. ${detail}`);
+  unavailable.diagnostics = diagnostics;
+  throw unavailable;
+}
+
 function demoCandles(symbol, range = "6M") {
   const window = candleWindow(range);
   const base = basePrice(symbol);
@@ -83,6 +383,74 @@ const demoMetrics = symbol => ({ metric: {
   "52WeekLow": basePrice(symbol) * 0.72
 } });
 
+async function alphaVantageOverview(env, symbol) {
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const overview = await alphaVantage(env, { function: "OVERVIEW", symbol: sourceSymbol });
+  if (!overview || !overview.Symbol) throw new Error("Alpha Vantage returned no company overview");
+  const shares = Number(overview.SharesOutstanding);
+  const marketCapDollars = Number(overview.MarketCapitalization);
+  const revenue = Number(overview.RevenueTTM);
+  return {
+    profile: {
+      name: overview.Name || `${symbol} Holdings`,
+      exchange: overview.Exchange || (symbol.startsWith("^") ? "INDEX" : "NASDAQ"),
+      finnhubIndustry: overview.Sector || overview.Industry || (symbol.startsWith("^") ? "Market Index" : "N/A"),
+      marketCapitalization: Number.isFinite(marketCapDollars) ? marketCapDollars / 1_000_000 : null,
+      shareOutstanding: Number.isFinite(shares) ? shares / 1_000_000 : null
+    },
+    metrics: { metric: {
+      epsTTM: Number(overview.EPS),
+      epsGrowth5Y: Number(overview.QuarterlyEarningsGrowthYOY) * 100,
+      peTTM: Number(overview.PERatio),
+      revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : Number(overview.RevenuePerShareTTM),
+      "52WeekHigh": Number(overview["52WeekHigh"]),
+      "52WeekLow": Number(overview["52WeekLow"])
+    } }
+  };
+}
+
+async function alphaVantageEarnings(env, symbol) {
+  const data = await alphaVantage(env, { function: "EARNINGS", symbol: alphaVantageSymbol(symbol) });
+  const rows = Array.isArray(data.quarterlyEarnings) ? data.quarterlyEarnings : [];
+  if (!rows.length) throw new Error("Alpha Vantage returned no earnings records");
+  return rows.slice(0, 12).map(row => {
+    const date = new Date(`${row.fiscalDateEnding}T00:00:00Z`);
+    const quarter = Math.floor(date.getUTCMonth() / 3) + 1;
+    const actual = Number(row.reportedEPS);
+    const estimate = Number(row.estimatedEPS);
+    return {
+      symbol,
+      year: date.getUTCFullYear(),
+      quarter,
+      period: `${date.getUTCFullYear()} Q${quarter}`,
+      actual,
+      estimate,
+      surprise: Number.isFinite(actual) && Number.isFinite(estimate) ? actual - estimate : Number(row.surprise)
+    };
+  });
+}
+
+function alphaNewsTimestamp(value) {
+  const match = String(value || "").match(/^(\d{4})(\d{2})(\d{2})T?(\d{2})(\d{2})(\d{2})/);
+  if (!match) return Math.floor(Date.now() / 1000);
+  const [, year, month, day, hour, minute, second] = match;
+  return Math.floor(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)) / 1000);
+}
+
+async function alphaVantageNews(env, symbol) {
+  const data = await alphaVantage(env, { function: "NEWS_SENTIMENT", tickers: alphaVantageSymbol(symbol), limit: 20 });
+  const rows = Array.isArray(data.feed) ? data.feed : [];
+  if (!rows.length) throw new Error("Alpha Vantage returned no news records");
+  return rows.slice(0, 20).map((story, index) => ({
+    id: story.url || `${symbol}-alpha-${index}`,
+    datetime: alphaNewsTimestamp(story.time_published),
+    headline: story.title || "Untitled",
+    source: story.source || "Alpha Vantage",
+    url: story.url || "#",
+    summary: story.summary || ""
+  }));
+}
+
 function demoEarnings(symbol) {
   return Array.from({ length: 8 }, (_, index) => {
     const date = new Date();
@@ -99,16 +467,30 @@ const demoNews = symbol => [
   { id: `${symbol}-demo-2`, datetime: Math.floor(Date.now() / 1000) - 10800, headline: `${symbol} traders watch earnings estimates and volume trend`, source: "MarketLens demo", url: "#", summary: "Use live provider data when connected; this keeps the news panel populated offline." }
 ];
 
-function macroRows(startYear, endYear, base, amplitude, trend = 0) {
+function monthIndex(date) {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  return parsed.getUTCFullYear() * 12 + parsed.getUTCMonth();
+}
+
+function monthDate(index) {
+  return `${Math.floor(index / 12)}-${String(index % 12 + 1).padStart(2, "0")}-01`;
+}
+
+function anchoredMacroRows(anchors, latestDate = "2026-06-01") {
+  const sorted = anchors.map(([date, value]) => ({ date, value: Number(value), index: monthIndex(date) })).sort((a, b) => a.index - b.index);
   const rows = [];
-  const now = new Date();
-  for (let year = startYear; year <= endYear; year++) {
-    for (let month = 0; month < 12; month++) {
-      if (year === now.getFullYear() && month > now.getMonth()) break;
-      const index = (year - startYear) * 12 + month;
-      const value = Math.max(0, base + Math.sin(index / 11) * amplitude + Math.cos(index / 29) * amplitude * 0.45 + trend * index);
-      rows.push({ date: `${year}-${String(month + 1).padStart(2, "0")}-01`, value: Number(value.toFixed(2)) });
+  for (let index = sorted[0].index; index <= monthIndex(latestDate); index++) {
+    let left = sorted[0], right = sorted.at(-1);
+    for (let anchorIndex = 1; anchorIndex < sorted.length; anchorIndex++) {
+      if (index <= sorted[anchorIndex].index) {
+        left = sorted[anchorIndex - 1];
+        right = sorted[anchorIndex];
+        break;
+      }
     }
+    const progress = Math.max(0, Math.min(1, (index - left.index) / Math.max(1, right.index - left.index)));
+    const cycle = Math.sin(index / 5.7) * 0.035 + Math.cos(index / 13.3) * 0.025;
+    rows.push({ date: monthDate(index), value: Number(Math.max(0, left.value + (right.value - left.value) * progress + cycle).toFixed(2)) });
   }
   return rows;
 }
@@ -116,21 +498,64 @@ function macroRows(startYear, endYear, base, amplitude, trend = 0) {
 function seriesSummary(id, name, frequency, units, rows) {
   const latest = rows.at(-1);
   const prior = rows.at(-2);
-  const yearAgo = rows[Math.max(0, rows.length - 13)] || rows[0];
+  const yearAgoDate = new Date(`${latest.date}T00:00:00Z`);
+  yearAgoDate.setUTCFullYear(yearAgoDate.getUTCFullYear() - 1);
+  const yearAgo = rows.reduce((best, row) => Math.abs(new Date(`${row.date}T00:00:00Z`) - yearAgoDate) < Math.abs(new Date(`${best.date}T00:00:00Z`) - yearAgoDate) ? row : best, rows[0]);
   return { id, name, frequency, units, rows, latest, prior, yearAgo };
 }
 
 function demoMacro() {
-  const endYear = new Date().getFullYear();
-  const unemployment = macroRows(1985, endYear, 5.1, 1.1, -0.001);
-  unemployment.push({ date: "2020-04-01", value: 14.7 });
-  unemployment.sort((a, b) => a.date.localeCompare(b.date));
+  const unemployment = anchoredMacroRows([["1985-01-01",7.3],["1989-03-01",5.0],["1992-06-01",7.8],["2000-04-01",3.8],["2003-06-01",6.3],["2007-05-01",4.4],["2009-10-01",10.0],["2015-12-01",5.0],["2019-12-01",3.6],["2020-04-01",14.7],["2021-12-01",3.9],["2023-04-01",3.4],["2024-12-01",4.1],["2026-05-01",4.3]], "2026-05-01");
+  const inflation = anchoredMacroRows([["1985-01-01",3.5],["1991-01-01",5.6],["1998-06-01",1.7],["2008-07-01",5.6],["2009-07-01",0.0],["2015-01-01",0.1],["2019-12-01",2.3],["2022-06-01",9.1],["2023-12-01",3.3],["2025-05-01",2.31],["2026-05-01",4.47]], "2026-05-01");
+  const fed = anchoredMacroRows([["1985-01-01",8.4],["1992-09-01",3.0],["2000-07-01",6.5],["2003-06-01",1.0],["2007-08-01",5.25],["2009-01-01",0.16],["2015-12-01",0.24],["2019-07-01",2.4],["2021-12-01",0.08],["2023-08-01",5.33],["2025-06-01",4.33],["2026-06-01",3.63]], "2026-06-01");
+  const treasury = anchoredMacroRows([["1985-01-01",11.4],["1993-10-01",5.3],["2000-01-01",6.7],["2003-06-01",3.3],["2007-06-01",5.1],["2012-07-01",1.5],["2018-11-01",3.2],["2020-08-01",0.6],["2022-10-01",4.1],["2023-10-01",4.9],["2025-06-01",4.21],["2026-06-01",4.45]], "2026-06-01");
   return { provider: "Demo fallback (offline)", fetchedAt: new Date().toISOString(), series: {
     unemployment: seriesSummary("UNRATE", "Unemployment Rate", "Monthly", "%", unemployment),
-    inflation: seriesSummary("CPIAUCSL", "Inflation (CPI YoY)", "Monthly, year-over-year", "%", macroRows(1985, endYear, 3.1, 1.4, 0.0005)),
-    fed: seriesSummary("FEDFUNDS", "Fed Funds Rate", "Monthly average", "%", macroRows(1985, endYear, 3.8, 2.1, -0.0015)),
-    treasury: seriesSummary("DGS10", "10-Year Treasury Yield", "Daily", "%", macroRows(1985, endYear, 4.6, 1.3, -0.001))
+    inflation: seriesSummary("CPIAUCSL", "Inflation (CPI YoY)", "Monthly, year-over-year", "%", inflation),
+    fed: seriesSummary("FEDFUNDS", "Fed Funds Rate", "Monthly average", "%", fed),
+    treasury: seriesSummary("DGS10", "10-Year Treasury Yield", "Daily", "%", treasury)
   } };
+}
+
+function parseFredCsv(csv) {
+  return String(csv || "").trim().split(/\r?\n/).slice(1).map(line => {
+    const [date, rawValue] = line.split(",");
+    const cleaned = String(rawValue ?? "").trim();
+    return { date, value: cleaned && cleaned !== "." ? Number(cleaned) : NaN };
+  }).filter(row => /^\d{4}-\d{2}-\d{2}$/.test(row.date) && Number.isFinite(row.value));
+}
+
+async function fredSeries(id) {
+  const url = new URL("https://fred.stlouisfed.org/graph/fredgraph.csv");
+  url.searchParams.set("id", id);
+  const response = await fetch(url, { headers: { accept: "text/csv", "user-agent": "MarketLens/1.0" } });
+  if (!response.ok) throw new Error(`FRED ${id} request failed (${response.status})`);
+  const rows = parseFredCsv(await response.text());
+  if (!rows.length) throw new Error(`FRED ${id} returned no observations`);
+  return rows;
+}
+
+async function macroIndicators() {
+  const [unemploymentRows, cpiRows, fedRows, treasuryRows] = await Promise.all([
+    fredSeries("UNRATE"), fredSeries("CPIAUCSL"), fredSeries("FEDFUNDS"), fredSeries("DGS10")
+  ]);
+  const cpiByDate = new Map(cpiRows.map(row => [row.date, row.value]));
+  const inflationRows = cpiRows.map(row => {
+    const previousDate = new Date(`${row.date}T00:00:00Z`);
+    previousDate.setUTCFullYear(previousDate.getUTCFullYear() - 1);
+    const previousValue = cpiByDate.get(previousDate.toISOString().slice(0, 10));
+    return { date: row.date, value: Number.isFinite(previousValue) && previousValue > 0 ? (row.value / previousValue - 1) * 100 : NaN };
+  }).filter(row => Number.isFinite(row.value));
+  return {
+    provider: "Federal Reserve Bank of St. Louis (FRED)",
+    fetchedAt: new Date().toISOString(),
+    series: {
+      unemployment: seriesSummary("UNRATE", "Unemployment Rate", "Monthly", "%", unemploymentRows),
+      inflation: seriesSummary("CPIAUCSL", "Inflation (CPI YoY)", "Monthly, year-over-year", "%", inflationRows),
+      fed: seriesSummary("FEDFUNDS", "Fed Funds Rate", "Monthly average", "%", fedRows),
+      treasury: seriesSummary("DGS10", "10-Year Treasury Yield", "Daily", "%", treasuryRows)
+    }
+  };
 }
 
 function demoSectors() {
@@ -241,17 +666,6 @@ async function marketDataGamma(env, symbol, requestedDte) {
   return summarizeGammaPayload(payload, symbol, requestedDte);
 }
 
-async function finnhub(env, endpoint, params) {
-  if (!env.FINNHUB_API_KEY) throw new Error("FINNHUB_API_KEY is not configured");
-  const url = new URL(`https://finnhub.io/api/v1/${endpoint}`);
-  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, String(value)));
-  url.searchParams.set("token", env.FINNHUB_API_KEY);
-  const response = await fetch(url, { headers: { accept: "application/json" } });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.error) throw new Error(data.error || `Finnhub request failed (${response.status})`);
-  return data;
-}
-
 async function readJson(request) {
   try {
     return await request.json();
@@ -266,11 +680,7 @@ async function aiChat(env, request) {
   const message = String(payload?.message || "").trim().slice(0, 4000);
   if (!message) return json({ error: "A message is required" }, 400);
   if (!key) {
-    return json({
-      answer: "I can help with the stock context already loaded in the app, but the production AI key is not configured yet. Add GEMINI_API_KEY in Cloudflare Pages environment variables to enable live AI responses.",
-      provider: "Market Copilot",
-      configured: false
-    });
+    return json({ error: "Live AI is not configured", configured: false }, 503);
   }
   const contextText = JSON.stringify(payload?.context || {}).slice(0, 12000);
   const history = Array.isArray(payload?.history) ? payload.history.slice(-8) : [];
@@ -278,7 +688,7 @@ async function aiChat(env, request) {
     .filter(item => ["user", "model"].includes(item?.role) && item?.text)
     .map(item => ({ role: item.role, parts: [{ text: String(item.text).slice(0, 4000) }] }));
   contents.push({ role: "user", parts: [{ text: message }] });
-  const model = env.GEMINI_MODEL || "gemini-3.5-flash";
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-goog-api-key": key },
@@ -298,69 +708,74 @@ async function stockPayload(env, url) {
   const symbol = validSymbol(url.searchParams.get("symbol"));
   if (!symbol) return json({ error: "Invalid ticker symbol" }, 400);
   const range = new Set(["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "10Y"]).has(url.searchParams.get("range")) ? url.searchParams.get("range") : "6M";
-  const window = candleWindow(range);
-  let candles = demoCandles(symbol, range);
-  let quote = demoQuote(symbol, candles);
+  let candles;
+  let quote;
   let profile = demoProfile(symbol);
   let metrics = demoMetrics(symbol);
   let earnings = demoEarnings(symbol);
   let news = demoNews(symbol);
-  const diagnostics = [{ provider: "Demo fallback", ok: true, authApplied: false, message: "Pages Function fallback is available" }];
+  const diagnostics = [];
   try {
-    const liveQuote = await finnhub(env, "quote", { symbol });
-    if (Number(liveQuote.c) > 0) quote = { ...liveQuote, provider: "Finnhub" };
-    diagnostics.unshift({ provider: "Finnhub quote", ok: Number(liveQuote.c) > 0, authApplied: true, message: "Quote returned" });
+    const market = await marketChart(env, symbol, range);
+    candles = market.candles;
+    quote = market.quote;
+    diagnostics.push(...market.diagnostics);
   } catch (error) {
-    diagnostics.unshift({ provider: "Finnhub quote", ok: false, authApplied: Boolean(env.FINNHUB_API_KEY), message: error.message });
+    diagnostics.push(...(error.diagnostics || []));
+    candles = demoCandles(symbol, range);
+    quote = demoQuote(symbol, candles);
+    diagnostics.push({ provider: "Demo fallback", ok: true, authApplied: false, message: "Offline fallback returned because Alpha Vantage, Google Finance, and Stooq were unreachable from this environment" });
   }
   try {
-    const liveCandles = await finnhub(env, "stock/candle", { symbol, resolution: window.resolution, from: window.from, to: window.to });
-    if (liveCandles?.s === "ok" && Array.isArray(liveCandles.c) && liveCandles.c.length > 2) candles = { ...liveCandles, symbol, range, displayFrom: window.displayFrom, resolution: window.resolution, provider: "Finnhub", fetchedAt: new Date().toISOString() };
+    const overview = await alphaVantageOverview(env, symbol);
+    profile = overview.profile;
+    metrics = overview.metrics;
   } catch {}
-  try { profile = await finnhub(env, "stock/profile2", { symbol }); } catch {}
-  try { metrics = await finnhub(env, "stock/metric", { symbol, metric: "all" }); } catch {}
-  try {
-    const today = new Date();
-    const to = today.toISOString().slice(0, 10);
-    today.setDate(today.getDate() - 30);
-    const liveNews = await finnhub(env, "company-news", { symbol, from: today.toISOString().slice(0, 10), to });
-    if (Array.isArray(liveNews) && liveNews.length) news = liveNews.slice(0, 20);
-  } catch {}
-  try {
-    const liveEarnings = await finnhub(env, "stock/earnings", { symbol, limit: 12 });
-    if (Array.isArray(liveEarnings) && liveEarnings.length) earnings = liveEarnings;
-  } catch {}
-  return json({ configured: true, provider: quote.provider === "Finnhub" || candles.provider === "Finnhub" ? "Finnhub + fallback" : "Demo fallback (offline)", fetchedAt: new Date().toISOString(), symbol, range, resolution: window.resolution, quoteProvider: quote.provider, candleProvider: candles.provider, dataDiagnostics: diagnostics, quote, profile, metrics, candles, probabilityCandles: demoCandles(symbol, "5Y"), earnings, news, sentiment: { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 }, recommendations: [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }] });
+  try { earnings = await alphaVantageEarnings(env, symbol); } catch {}
+  try { news = await alphaVantageNews(env, symbol); } catch {}
+  let probabilityCandles = candles;
+  try { probabilityCandles = (await marketChart(env, symbol, "5Y")).candles; } catch {}
+  return json({ configured: true, provider: candles.provider || "Market data", fetchedAt: new Date().toISOString(), symbol, range, resolution: candles.resolution, quoteProvider: quote.provider, candleProvider: candles.provider, dataDiagnostics: diagnostics, quote, profile, metrics, candles, probabilityCandles, earnings, news, sentiment: { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 }, recommendations: [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }] });
 }
 
 export async function onRequest(context) {
   const url = new URL(context.request.url);
   const pathname = url.pathname;
-  if (pathname === "/api/finnhub/stock") return stockPayload(context.env, url);
-  if (pathname === "/api/finnhub/status") return json({ configured: Boolean(context.env.FINNHUB_API_KEY), provider: "Finnhub" });
+  if (pathname === "/api/market/stock" || pathname === "/api/finnhub/stock") return stockPayload(context.env, url);
+  if (pathname === "/api/market/status" || pathname === "/api/finnhub/status") return json({ configured: Boolean(alphaVantageKey(context.env)), provider: "Alpha Vantage" });
   if (pathname === "/api/market-data/status") return json({ configured: Boolean(context.env.MARKET_DATA_API_TOKEN), provider: "Market Data" });
-  if (pathname === "/api/finnhub/candles") {
+  if (pathname === "/api/market/candles" || pathname === "/api/finnhub/candles") {
     const symbol = validSymbol(url.searchParams.get("symbol"));
     if (!symbol) return json({ error: "Invalid ticker symbol" }, 400);
     const range = new Set(["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "10Y"]).has(url.searchParams.get("range")) ? url.searchParams.get("range") : "6M";
-    const window = candleWindow(range);
     try {
-      const liveCandles = await finnhub(context.env, "stock/candle", { symbol, resolution: window.resolution, from: window.from, to: window.to });
-      if (liveCandles?.s === "ok" && Array.isArray(liveCandles.c) && liveCandles.c.length > 2) {
-        return json({ ...liveCandles, symbol, range, displayFrom: window.displayFrom, resolution: window.resolution, provider: "Finnhub", fetchedAt: new Date().toISOString() });
-      }
-    } catch {}
-    return json(demoCandles(symbol, range));
+      return json((await marketChart(context.env, symbol, range)).candles);
+    } catch (error) {
+      return json({
+        ...demoCandles(symbol, range),
+        detail: `Live historical candle requests failed: ${error.message}`,
+        dataDiagnostics: [
+          ...(error.diagnostics || []),
+          { provider: "Demo fallback", ok: true, authApplied: false, message: "Offline fallback returned because live providers were unreachable from this environment" }
+        ]
+      });
+    }
   }
-  if (pathname === "/api/finnhub/stream") {
+  if (pathname === "/api/market/stream" || pathname === "/api/finnhub/stream") {
     const symbol = validSymbol(url.searchParams.get("symbol"));
-    const candles = symbol ? demoCandles(symbol, "1D") : null;
-    const quote = symbol ? demoQuote(symbol, candles) : null;
+    let quote = null;
+    try { if (symbol) quote = (await marketChart(context.env, symbol, "1D")).quote; } catch {}
     return new Response(`event: quote\ndata: ${JSON.stringify({ symbol, ...quote })}\n\n`, {
       headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" }
     });
   }
-  if (pathname === "/api/macro/indicators") return json(demoMacro());
+  if (pathname === "/api/macro/indicators") {
+    try {
+      return json(await macroIndicators());
+    } catch (error) {
+      return json({ ...demoMacro(), detail: `FRED macro data unavailable: ${error.message}` });
+    }
+  }
   if (pathname === "/api/macro/sector-etfs") return json(demoSectors());
   if (pathname === "/api/cnn/fear-greed") return json(demoFearGreed());
   if (pathname === "/api/options/gamma") {

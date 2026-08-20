@@ -128,10 +128,11 @@ worldChatState.seenMessageIds = new Set();
 localStorage.setItem("marketlens-chat-session", worldChatState.sessionId);
 let worldChatTimer = null;
 const marketData = { configured: null, loading: false, error: "", candles: {}, probabilityCandles: {}, diagnostics: {}, news: {}, sentiment: {}, recommendations: {}, earnings: {}, liveSymbols: new Set(), spCandles: null, spLoading: false, spError: "", macro: { loading: false, error: "", data: null, sectors: null, sectorError: "" }, cnn: { loading: false, error: "", data: null } };
-let finnhubEventSource = null;
+let marketEventSource = null;
 let priceChartResizeObserver = null;
 let watchlistRefreshPromise = null;
-const watchlistRefreshAttempted = new Set();
+const stockRefreshTimes = {};
+const STOCK_REFRESH_INTERVAL_MS = 90_000;
 
 function userProfileSnapshot() {
   return {
@@ -222,6 +223,21 @@ const compactNumber = (n) => !Number.isFinite(n) ? "N/A" : n >= 1e9 ? `${(n / 1e
 const marketCapLabel = n => !Number.isFinite(n) ? "N/A" : n >= 1e6 ? `$${(n / 1e6).toFixed(2)}T` : `$${(n / 1e3).toFixed(2)}B`;
 const active = (value, current) => value === current ? "active" : "";
 const escapeHtml = (value) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char]));
+function marketFreshnessLabel(symbol) {
+  const stock = stocks[symbol] || {};
+  const candles = marketData.candles[symbol];
+  const quoteTime = Number(stock.quoteTime);
+  const candleTime = Array.isArray(candles?.t) ? Number(candles.t.at(-1)) : NaN;
+  const timestamp = Number.isFinite(quoteTime) && quoteTime > 0 ? quoteTime : candleTime;
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "Latest market date unavailable";
+  const date = new Date(timestamp * 1000);
+  const label = date.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+  const today = new Date();
+  const sameDay = date.toDateString() === today.toDateString();
+  const marketClosed = [0, 6].includes(today.getDay());
+  if (marketClosed && !sameDay) return `Latest trading day: ${label}`;
+  return `${sameDay ? "Latest market data" : "Latest trading day"}: ${label}`;
+}
 const defaultWatchlistQuotes = {
   AAPL: { name: "Apple Inc.", price: 212.41, change: 1.18, pct: 0.56, venue: "NASDAQ", sector: "Technology" },
   MSFT: { name: "Microsoft Corp.", price: 501.48, change: 2.06, pct: 0.41, venue: "NASDAQ", sector: "Technology" },
@@ -261,6 +277,10 @@ ensureStock(ticker);
 
 function usablePayload(value) {
   return value && !value.unavailable;
+}
+
+function isDemoProvider(value) {
+  return /demo fallback|offline/i.test(String(value || ""));
 }
 
 function calculateRsi(closes, period = 14) {
@@ -418,10 +438,11 @@ async function refreshTickerData(symbol, rerender = true) {
   marketData.error = "";
   if (rerender && route() === "/") dashboard();
   try {
-    const response = await fetch(`/api/finnhub/stock?symbol=${encodeURIComponent(requested)}&range=${chartRange}`);
+    const response = await fetch(`/api/market/stock?symbol=${encodeURIComponent(requested)}&range=${chartRange}`);
     const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Finnhub request failed");
+    if (!response.ok) throw new Error(payload.error || "Market data request failed");
     marketData.configured = true;
+    const providerLabel = payload.quoteProvider || payload.quote?.provider || payload.provider || "";
     const hasLiveQuote = usablePayload(payload.quote) && Number(payload.quote.c) > 0;
     const quote = hasLiveQuote ? payload.quote : {};
     const profile = usablePayload(payload.profile) ? payload.profile : {};
@@ -447,8 +468,9 @@ async function refreshTickerData(symbol, rerender = true) {
       weekLow: Number(metrics["52WeekLow"]) || null,
       marketCap: Number(profile.marketCapitalization) || Number(metrics.marketCapitalization) || null,
       volume: usablePayload(payload.candles) && Array.isArray(payload.candles.v) ? payload.candles.v.at(-1) : null,
-      updatedAt: payload.fetchedAt,
-      quoteProvider: payload.quoteProvider || payload.provider || "Finnhub"
+      updatedAt: payload.fetchedAt || new Date().toISOString(),
+      quoteTime: Number(quote.t) || null,
+      quoteProvider: providerLabel || "Alpha Vantage"
     });
     const pe = Number(metrics.peTTM) || Number(metrics.peNormalizedAnnual);
     const revenuePerShare = Number(metrics.revenuePerShareTTM);
@@ -469,12 +491,13 @@ async function refreshTickerData(symbol, rerender = true) {
     if (Array.isArray(payload.recommendations)) marketData.recommendations[requested] = payload.recommendations;
     if (Array.isArray(payload.earnings)) marketData.earnings[requested] = payload.earnings;
     if (hasLiveQuote) {
+      stockRefreshTimes[requested] = Date.now();
       marketData.liveSymbols.add(requested);
-      if (payload.quoteProvider === "Finnhub") connectFinnhubStream(requested);
+      if (payload.quoteProvider === "Realtime stream") connectMarketStream(requested);
     }
     else {
       marketData.liveSymbols.delete(requested);
-      marketData.error = payload.quote?.message || "Neither Finnhub nor Yahoo Finance returned a current quote for this symbol.";
+      marketData.error = payload.quote?.message || `${requested} did not return a verified live quote. Provider returned ${providerLabel || "no provider"}.`;
     }
   } catch (error) {
     marketData.configured = !String(error.message).includes("not configured");
@@ -488,29 +511,34 @@ async function refreshTickerData(symbol, rerender = true) {
   }
 }
 
+function stockNeedsRefresh(symbol, force = false) {
+  if (force) return true;
+  const lastRefresh = stockRefreshTimes[symbol] || 0;
+  return Date.now() - lastRefresh > STOCK_REFRESH_INTERVAL_MS;
+}
+
 async function refreshChartData(symbol = ticker, range = chartRange) {
   const requested = ensureStock(symbol);
   marketData.loading = true;
   marketData.error = "";
   if (route() === "/") dashboard();
   try {
-    const response = await fetch(`/api/finnhub/candles?symbol=${encodeURIComponent(requested)}&range=${encodeURIComponent(range)}`);
+    const response = await fetch(`/api/market/candles?symbol=${encodeURIComponent(requested)}&range=${encodeURIComponent(range)}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || payload.error || "Historical candle request failed");
     marketData.candles[requested] = payload;
   } catch (error) {
-    marketData.candles[requested] = { unavailable: true, provider: "Finnhub + Yahoo Finance", range, message: error.message };
+    marketData.candles[requested] = { unavailable: true, provider: "Market data", range, message: error.message };
   } finally {
     marketData.loading = false;
     if (route() === "/") dashboard();
   }
 }
 
-async function refreshWatchlistData() {
+async function refreshWatchlistData({ force = false } = {}) {
   if (watchlistRefreshPromise) return watchlistRefreshPromise;
-  const symbols = [...new Set(watchlist.map(ensureStock))].filter(symbol => !marketData.liveSymbols.has(symbol) && !watchlistRefreshAttempted.has(symbol));
+  const symbols = [...new Set([ticker, ...watchlist].map(ensureStock))].filter(symbol => stockNeedsRefresh(symbol, force));
   if (!symbols.length) return null;
-  symbols.forEach(symbol => watchlistRefreshAttempted.add(symbol));
   watchlistRefreshPromise = Promise.allSettled(symbols.map(symbol => refreshTickerData(symbol, false))).finally(() => {
     watchlistRefreshPromise = null;
     if (route() === "/") dashboard();
@@ -518,12 +546,12 @@ async function refreshWatchlistData() {
   return watchlistRefreshPromise;
 }
 
-function connectFinnhubStream(symbol) {
-  if (finnhubEventSource?.datasetSymbol === symbol) return;
-  finnhubEventSource?.close();
-  finnhubEventSource = new EventSource(`/api/finnhub/stream?symbol=${encodeURIComponent(symbol)}`);
-  finnhubEventSource.datasetSymbol = symbol;
-  finnhubEventSource.addEventListener("quote", event => {
+function connectMarketStream(symbol) {
+  if (marketEventSource?.datasetSymbol === symbol) return;
+  marketEventSource?.close();
+  marketEventSource = new EventSource(`/api/market/stream?symbol=${encodeURIComponent(symbol)}`);
+  marketEventSource.datasetSymbol = symbol;
+  marketEventSource.addEventListener("quote", event => {
     try {
       const payload = JSON.parse(event.data), quote = payload.quote, stock = stocks[symbol];
       if (!stock || !Number.isFinite(Number(quote?.c)) || Number(quote.c) <= 0) return;
@@ -594,7 +622,7 @@ async function refreshMacroData() {
   try {
     const lookbackRange = "10Y";
     const [response, macroResponse, sectorResponse] = await Promise.all([
-      fetch(`/api/finnhub/stock?symbol=${encodeURIComponent("^GSPC")}&range=${lookbackRange}&interval=Daily`),
+      fetch(`/api/market/stock?symbol=${encodeURIComponent("^GSPC")}&range=${lookbackRange}&interval=Daily`),
       fetch("/api/macro/indicators"),
       fetch("/api/macro/sector-etfs")
     ]);
@@ -778,8 +806,8 @@ function dashboard() {
   if (!isLive) {
     pageShell("Dashboard", "Search verified market data by ticker", `
       <div class="toolbar"><input id="ticker-input" placeholder="Ticker (AAPL, MSFT...)" value="${escapeHtml(ticker)}"><button class="primary" id="analyze">Analyze</button><span class="data-source error">Market data unavailable</span></div>
-      <section class="card data-empty section"><h2>${marketData.loading ? `Loading ${escapeHtml(ticker)}` : `${escapeHtml(ticker)} could not be verified`}</h2><p>${escapeHtml(marketData.loading ? "Requesting the quote and OHLC history from Finnhub..." : marketData.error || "Finnhub has not returned a verified quote.")}</p><p class="subtle section">No generated prices or fallback market data are displayed.</p></section>`);
-    const retry = () => { ticker = ensureStock(document.querySelector("#ticker-input").value); refreshTickerData(ticker); };
+      <section class="card data-empty section"><h2>${marketData.loading ? `Loading ${escapeHtml(ticker)}` : `${escapeHtml(ticker)} could not be verified`}</h2><p>${escapeHtml(marketData.loading ? "Requesting the quote and OHLC history from live providers..." : marketData.error || "No live provider has returned a verified quote.")}</p><p class="subtle section">No generated prices or fallback market data are displayed.</p></section>`);
+    const retry = () => { ticker = ensureStock(document.querySelector("#ticker-input").value); refreshTickerData(ticker, true, { force: true }); };
     document.querySelector("#analyze").onclick = retry;
     document.querySelector("#ticker-input").onkeydown = event => { if (event.key === "Enter") retry(); };
     return;
@@ -817,19 +845,21 @@ function dashboard() {
   const priceTarget = customTargetPrices.price ?? s.price * 1.05;
   const optionsTarget = customTargetPrices.options ?? s.price * 1.05;
   const gamma = gammaExposure.data?.symbol === gammaExposure.symbol ? gammaExposure.data : null;
-  const candleProvider = marketData.candles[ticker]?.s === "ok" ? marketData.candles[ticker].provider || "Finnhub" : "History unavailable";
-  const quoteProvider = s.quoteProvider || "Finnhub";
+  const candleProvider = marketData.candles[ticker]?.s === "ok" ? marketData.candles[ticker].provider || "Alpha Vantage" : "History unavailable";
+  const quoteProvider = s.quoteProvider || "Alpha Vantage";
+  const freshnessLabel = marketFreshnessLabel(ticker);
   pageShell("Dashboard", "Multi-horizon probability + options + targets", `
     <div class="toolbar">
       <input id="ticker-input" placeholder="Ticker (AAPL, BTC-USD...)" value="${ticker}">
       <button class="primary" id="analyze">Analyze</button>
+      <button id="refresh-all" type="button">Refresh data</button>
       <span class="subtle">Search any ticker here. Save tickers below in the Watchlist.</span>
-      <span class="data-source live">${escapeHtml(quoteProvider)} quote · ${escapeHtml(candleProvider)} OHLC · ${s.updatedAt ? new Date(s.updatedAt).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}) : "current"}</span>
+      <span class="data-source live">${escapeHtml(quoteProvider)} quote - ${escapeHtml(candleProvider)} OHLC - ${escapeHtml(freshnessLabel)} - refreshed ${s.updatedAt ? new Date(s.updatedAt).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}) : "now"}</span>
     </div>
 
     <section class="card watchlist-card">
-      <div class="watchlist-head"><div><h3>Watchlist</h3><p class="subtle">Track symbols and open them in the dashboard</p></div><div class="watchlist-add"><input id="watchlist-input" placeholder="Add ticker"><button class="primary" id="watchlist-add">Add</button></div></div>
-      <div class="watchlist-grid section">${watchlist.map(symbol => { const item = stocks[ensureStock(symbol)]; return `<div class="watchlist-item"><button class="watchlist-open" data-watch-symbol="${symbol}"><span><b>${symbol}</b><small>${item.name}</small></span><span><strong>${fmt(item.price)}</strong><small class="${item.change >= 0 ? "green" : "red"}">${pct(item.pct)}</small></span></button><button class="watchlist-remove" data-remove-symbol="${symbol}" title="Remove ${symbol}" aria-label="Remove ${symbol}">&times;</button></div>`; }).join("")}</div>
+      <div class="watchlist-head"><div><h3>Watchlist</h3><p class="subtle">Track symbols and open them in the dashboard</p></div><div class="watchlist-add"><input id="watchlist-input" placeholder="Add ticker"><button class="primary" id="watchlist-add">Add</button><button id="watchlist-refresh" type="button">Refresh</button></div></div>
+      <div class="watchlist-grid section">${watchlist.map(symbol => { const key = ensureStock(symbol), item = stocks[key], verified = marketData.liveSymbols.has(key); return `<div class="watchlist-item"><button class="watchlist-open" data-watch-symbol="${key}"><span><b>${key}</b><small>${item.name}</small></span><span><strong>${verified ? fmt(item.price) : marketData.loading ? "Loading" : "N/A"}</strong><small class="${verified ? item.change >= 0 ? "green" : "red" : "muted"}">${verified ? pct(item.pct) : "Refresh"}</small></span></button><button class="watchlist-remove" data-remove-symbol="${key}" title="Remove ${key}" aria-label="Remove ${key}">&times;</button></div>`; }).join("")}</div>
     </section>
 
     <section class="quote">
@@ -838,7 +868,7 @@ function dashboard() {
         <h2>${s.name}<span class="muted"> ${ticker}</span></h2>
         <div class="quote-price">${fmt(s.price)}</div>
         <p class="${s.change >= 0 ? "green" : "red"}">${s.change >= 0 ? "+" : ""}${s.change.toFixed(2)} (${pct(s.pct)})</p>
-        <p class="subtle section">${escapeHtml(quoteProvider)} market snapshot for ${ticker}. Quote and profile fields are returned by the backend data service.</p>
+        <p class="subtle section">${escapeHtml(quoteProvider)} market snapshot for ${ticker}. ${escapeHtml(freshnessLabel)}.</p>
         <p class="subtle data-diagnostics">${escapeHtml(diagnosticSummary)}</p>
         <div class="stat-grid">
           ${[["Open", fmt(s.open)], ["High", fmt(s.high)], ["Low", fmt(s.low)], ["Prev Close", fmt(s.prev)], ["Day Range", `${fmt(s.low)} - ${fmt(s.high)}`], ["52W Range", s.weekLow && s.weekHigh ? `${fmt(s.weekLow)} - ${fmt(s.weekHigh)}` : "N/A"], ["Volume", compactNumber(s.volume)], ["Market Cap", s.type === "CRYPTO" ? "N/A" : marketCapLabel(s.marketCap)]].map(([k,v]) => `<div class="stat"><div class="metric">${k}</div><strong>${v}</strong></div>`).join("")}
@@ -849,7 +879,7 @@ function dashboard() {
           <div class="metric">Directional Probability</div>
           <div class="toolbar" style="justify-content:center">${Object.keys(probs).map(h => `<button class="${active(h, horizon)}" data-horizon="${h}">${h}</button>`).join("")}</div>
           <strong>${directionalValue(horizon)}</strong>
-          <p class="subtle">${directional.available ? `chance higher in ${horizon === "1M" ? "1 month" : horizon.toLowerCase()} · ${swingValue(horizon)} expected swing` : "Requires verified Finnhub candle history"}</p>
+          <p class="subtle">${directional.available ? `chance higher in ${horizon === "1M" ? "1 month" : horizon.toLowerCase()} · ${swingValue(horizon)} expected swing` : "Requires verified Alpha Vantage candle history"}</p>
           <div class="bar section"><span style="width:${directional.available ? probs[horizon] : 0}%"></span></div>
           <div class="row muted"><span>Bearish</span><span>50/50</span><span>Bullish</span></div>
         </div>
@@ -926,13 +956,13 @@ function dashboard() {
       </div>
       <div class="card clickable" data-detail="earnings">
         <h3>Earnings Reports</h3><p class="subtle">Reported and estimated quarterly EPS for ${ticker}</p>
-        ${earningsRows.length ? `<div class="earnings-controls toolbar section"><button class="${earningsShowEstimates ? "active" : ""}" data-estimates-toggle>${earningsShowEstimates ? "Hide Estimates" : "Show Estimates"}</button><span class="subtle">${earningsShowEstimates ? "Actual EPS and estimate bars are visible." : "Only actual EPS bars are visible."}</span></div><div class="earnings-legend section"><span class="actual">Actual EPS</span>${earningsShowEstimates ? `<span class="estimate">Estimate</span>` : ""}<strong>${earningsRows.length} quarters</strong></div><canvas id="earnings-chart" class="earnings-chart" aria-label="${ticker} quarterly actual and estimated EPS"></canvas><div class="earnings-values">${earningsRows.slice().reverse().map(row => `<div><span>${escapeHtml(String(row.period || `${row.year || ""} Q${row.quarter || ""}`))}</span><strong>${fmt(Number(row.actual))}${earningsShowEstimates ? ` / ${fmt(Number(row.estimate))}` : ""}</strong><small class="${Number(row.surprise) >= 0 ? "green" : "amber"}">${earningsShowEstimates && Number.isFinite(Number(row.surprise)) ? `${Number(row.surprise) >= 0 ? "+" : ""}${Number(row.surprise).toFixed(2)} surprise` : earningsShowEstimates ? "Estimate unavailable" : "Estimate hidden"}</small></div>`).join("")}</div>` : `<div class="data-empty section"><p>Finnhub did not return earnings records for this symbol.</p></div>`}
+        ${earningsRows.length ? `<div class="earnings-controls toolbar section"><button class="${earningsShowEstimates ? "active" : ""}" data-estimates-toggle>${earningsShowEstimates ? "Hide Estimates" : "Show Estimates"}</button><span class="subtle">${earningsShowEstimates ? "Actual EPS and estimate bars are visible." : "Only actual EPS bars are visible."}</span></div><div class="earnings-legend section"><span class="actual">Actual EPS</span>${earningsShowEstimates ? `<span class="estimate">Estimate</span>` : ""}<strong>${earningsRows.length} quarters</strong></div><canvas id="earnings-chart" class="earnings-chart" aria-label="${ticker} quarterly actual and estimated EPS"></canvas><div class="earnings-values">${earningsRows.slice().reverse().map(row => `<div><span>${escapeHtml(String(row.period || `${row.year || ""} Q${row.quarter || ""}`))}</span><strong>${fmt(Number(row.actual))}${earningsShowEstimates ? ` / ${fmt(Number(row.estimate))}` : ""}</strong><small class="${Number(row.surprise) >= 0 ? "green" : "amber"}">${earningsShowEstimates && Number.isFinite(Number(row.surprise)) ? `${Number(row.surprise) >= 0 ? "+" : ""}${Number(row.surprise).toFixed(2)} surprise` : earningsShowEstimates ? "Estimate unavailable" : "Estimate hidden"}</small></div>`).join("")}</div>` : `<div class="data-empty section"><p>Alpha Vantage did not return earnings records for this symbol.</p></div>`}
       </div>
     </section>
 
     <section class="grid cols-2 section">
       ${probabilityPanel("Price target probability", "Chance of reaching a target price across timeframes", priceTarget, "Probability of reaching", "price", false, "target-probability")}
-      ${probabilityPanel("Options probability", "Yahoo historical outcomes blended with current listed-option implied volatility", optionsTarget, "Terminal-price probability", "options", true, "options-probability")}
+      ${probabilityPanel("Options probability", "Historical outcomes blended with current listed-option implied volatility", optionsTarget, "Terminal-price probability", "options", true, "options-probability")}
     </section>
   `);
   arrangeDashboardLayout();
@@ -1113,7 +1143,7 @@ function macro() {
   };
   pageShell("Macro", "Official FRED economic indicators and market-index context", `
     <section class="grid cols-2 macro-indicator-grid">${indicatorCard("unemployment", "Unemployment Rate", "UNRATE")}${indicatorCard("inflation", "Inflation (CPI YoY)", "CPIAUCSL")}${indicatorCard("fed", "Fed Funds Rate", "FEDFUNDS")}${indicatorCard("treasury", "10-Year Treasury Yield", "DGS10")}</section>
-    <section class="card sp500-card"><div class="sp500-head"><div><h2>S&amp;P 500 Index vs Moving Averages</h2><p class="subtle">^GSPC · ${spRange} · ${marketData.spLoading ? "Loading market history" : marketData.spCandles ? escapeHtml(marketData.spCandles.provider || "Finnhub") : marketData.spError || "History unavailable"}</p></div><div class="sp500-controls"><div class="pill-list">${comparison("50-day",sma50)}${comparison("200-day",sma200)}</div><div class="segmented">${["6M","1Y","2Y","5Y","10Y"].map(range => `<button class="${active(range,spRange)}" data-sp-range="${range}">${range}</button>`).join("")}</div></div></div>${marketData.spCandles ? `<canvas id="macro-chart" class="sp500-chart section" aria-label="S&P 500 history with moving averages from ${escapeHtml(marketData.spCandles.provider || "Finnhub")}"></canvas>` : `<div class="data-empty section"><p>${escapeHtml(marketData.spLoading ? "Requesting index candles..." : marketData.spError || "Index candles are unavailable from Finnhub and Yahoo Finance.")}</p></div>`}<div class="grid cols-3 sp500-metrics section"><div><div class="metric">Last</div><strong>${Number.isFinite(last)?last.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div><div><div class="metric">SMA 50</div><strong>${Number.isFinite(sma50)?sma50.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div><div><div class="metric">SMA 200</div><strong>${Number.isFinite(sma200)?sma200.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div></div></section>
+    <section class="card sp500-card"><div class="sp500-head"><div><h2>S&amp;P 500 Index vs Moving Averages</h2><p class="subtle">^GSPC · ${spRange} · ${marketData.spLoading ? "Loading market history" : marketData.spCandles ? escapeHtml(marketData.spCandles.provider || "Alpha Vantage") : marketData.spError || "History unavailable"}</p></div><div class="sp500-controls"><div class="pill-list">${comparison("50-day",sma50)}${comparison("200-day",sma200)}</div><div class="segmented">${["6M","1Y","2Y","5Y","10Y"].map(range => `<button class="${active(range,spRange)}" data-sp-range="${range}">${range}</button>`).join("")}</div></div></div>${marketData.spCandles ? `<canvas id="macro-chart" class="sp500-chart section" aria-label="S&P 500 history with moving averages from ${escapeHtml(marketData.spCandles.provider || "Alpha Vantage")}"></canvas>` : `<div class="data-empty section"><p>${escapeHtml(marketData.spLoading ? "Requesting index candles..." : marketData.spError || "Index candles are unavailable from Alpha Vantage or Stooq.")}</p></div>`}<div class="grid cols-3 sp500-metrics section"><div><div class="metric">Last</div><strong>${Number.isFinite(last)?last.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div><div><div class="metric">SMA 50</div><strong>${Number.isFinite(sma50)?sma50.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div><div><div class="metric">SMA 200</div><strong>${Number.isFinite(sma200)?sma200.toLocaleString(undefined,{maximumFractionDigits:2}):"N/A"}</strong></div></div></section>
     <section class="card sector-etf-card"><div class="sector-etf-head"><div><h2>Sector ETF Performance</h2><p class="subtle">S&amp;P 500 Select Sector SPDR ETFs · ${escapeHtml(sectorProvider)}</p></div><div class="segmented">${Object.entries(sectorLabels).map(([key,label]) => `<button class="${active(key,sectorRange)}" data-sector-range="${key}">${label}</button>`).join("")}</div></div>${sectorRows.length ? `<div class="sector-etf-list section">${sectorRows.map(row => { const value=Number(row[sectorRange]); return `<div class="sector-etf-row"><strong>${escapeHtml(row.symbol)}</strong><span>${escapeHtml(row.name)}</span><div class="sector-bar"><i class="${value >= 0 ? "positive" : "negative"}" style="width:${Math.max(2,Math.abs(value)/sectorMax*100)}%"></i></div><b class="${value >= 0 ? "green" : "red"}">${value >= 0 ? "+" : ""}${value.toFixed(2)}%</b></div>`; }).join("")}</div><p class="subtle section">Source: ${escapeHtml(marketData.macro.sectors.provider)} · Updated ${new Date(marketData.macro.sectors.fetchedAt).toLocaleString()}</p>` : `<div class="data-empty section"><p>${escapeHtml(marketData.macro.loading ? "Loading sector ETF history..." : marketData.macro.sectorError || "Sector ETF performance is unavailable.")}</p></div>`}</section>
     ${macroResearchSections(last)}
     <p class="subtle section">Economic data: Federal Reserve Bank of St. Louis (FRED). CPI inflation is calculated as the year-over-year percentage change in CPIAUCSL. Latest observations may be revised by their source.</p>`);
@@ -1144,7 +1174,7 @@ function news() {
       <div class="news-summary-head"><div><p class="metric">AI NEWS SUMMARY - UPDATED HOURLY</p><h2>${ticker}: why is this stock ${s.pct >= 0 ? "up" : "down"} today?</h2></div><div class="${s.pct >= 0 ? "green" : "red"}"><strong>${pct(s.pct)}</strong><span>${fmt(s.price)}</span></div></div>
       <div id="news-ai-summary" class="news-ai-summary section"></div>
     </section>
-    <section class="card section"><div class="news-source-head"><div><h3>Sources linked</h3><p class="subtle">Company headlines from Finnhub. Last app refresh: ${escapeHtml(hourlyLabel)}.</p></div><span class="pill">${marketData.loading ? "Refreshing" : "Hourly summary"}</span></div><div id="news-list" class="section"></div></section>`);
+    <section class="card section"><div class="news-source-head"><div><h3>Sources linked</h3><p class="subtle">Company headlines from Alpha Vantage. Last app refresh: ${escapeHtml(hourlyLabel)}.</p></div><span class="pill">${marketData.loading ? "Refreshing" : "Hourly summary"}</span></div><div id="news-list" class="section"></div></section>`);
   renderNews();
   const searchNews = () => { ticker = ensureStock(document.querySelector("#news-input").value); news(); refreshTickerData(ticker); };
   document.querySelector("#news-search").onclick = searchNews;
@@ -1163,7 +1193,7 @@ function renderNews() {
         : marketData.error || "Try refreshing the ticker or checking another symbol. The quote can still be live even when company-specific news is sparse.";
       summary.innerHTML = `<div class="news-answer"><strong>${marketData.loading ? "Checking today's news..." : "No fresh company headlines found yet."}</strong><p>${escapeHtml(emptyText)}</p></div>`;
     }
-    list.innerHTML = `<p class="subtle">${marketData.loading ? "Loading Finnhub news..." : marketData.error || "No Finnhub company news is available for this symbol."}</p>`;
+    list.innerHTML = `<p class="subtle">${marketData.loading ? "Loading Alpha Vantage news..." : marketData.error || "No Alpha Vantage company news is available for this symbol."}</p>`;
     return;
   }
   const genericCompanyWords = new Set(["inc", "corp", "corporation", "company", "holdings", "class", "plc", "ltd", "limited", "com"]);
@@ -1196,7 +1226,7 @@ function renderNews() {
   list.innerHTML = stories.map(story => {
     const text = `${story.headline || ""} ${story.summary || ""}`.toLowerCase();
     const relevant = mentionsCompany(text);
-    return `<article class="news-item"><h3><a href="${escapeHtml(story.url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHtml(story.headline || "Untitled")}</a></h3><p class="muted">${escapeHtml(story.source || "Finnhub")} - ${new Date(Number(story.datetime) * 1000).toLocaleString()}${relevant ? " - Ticker match" : ""}</p>${story.summary ? `<p class="subtle">${escapeHtml(story.summary)}</p>` : ""}</article>`;
+    return `<article class="news-item"><h3><a href="${escapeHtml(story.url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHtml(story.headline || "Untitled")}</a></h3><p class="muted">${escapeHtml(story.source || "Alpha Vantage")} - ${new Date(Number(story.datetime) * 1000).toLocaleString()}${relevant ? " - Ticker match" : ""}</p>${story.summary ? `<p class="subtle">${escapeHtml(story.summary)}</p>` : ""}</article>`;
   }).join("");
 }
 
@@ -1379,6 +1409,14 @@ function bindDashboard() {
   const analyzeTicker = () => selectTicker(document.querySelector("#ticker-input").value);
   document.querySelector("#analyze").onclick = analyzeTicker;
   document.querySelector("#ticker-input").onkeydown = event => { if (event.key === "Enter") analyzeTicker(); };
+  const forceRefreshAll = () => {
+    marketData.error = "";
+    stockRefreshTimes[ticker] = 0;
+    [...new Set([ticker, ...watchlist].map(ensureStock))].forEach(symbol => { stockRefreshTimes[symbol] = 0; });
+    refreshWatchlistData({ force: true });
+    refreshGammaExposure(ticker, gammaExposure.dte);
+  };
+  document.querySelector("#refresh-all")?.addEventListener("click", forceRefreshAll);
   const analyzeGamma = () => refreshGammaExposure(document.querySelector("#gamma-ticker").value, gammaExposure.dte);
   document.querySelector("#gamma-search").onclick = analyzeGamma;
   document.querySelector("#gamma-ticker").onkeydown = event => { if (event.key === "Enter") analyzeGamma(); };
@@ -1398,6 +1436,7 @@ function bindDashboard() {
   };
   document.querySelector("#watchlist-add").onclick = addWatchlistTicker;
   document.querySelector("#watchlist-input").onkeydown = event => { if (event.key === "Enter") addWatchlistTicker(); };
+  document.querySelector("#watchlist-refresh")?.addEventListener("click", forceRefreshAll);
   document.querySelectorAll("[data-indicator]").forEach(input => input.onchange = () => {
     chartIndicators[input.dataset.indicator] = input.checked;
     drawPriceChart();
@@ -1468,7 +1507,7 @@ function openDetail(kind) {
     },
     "directional-probability": {
       title: "Directional probability model",
-      body: `<p>The ${horizon} estimate for ${ticker} blends its moving-average trend, 20-session momentum, RSI, and realized volatility from verified ${escapeHtml(marketData.candles[ticker]?.provider || "market")} candles.</p><div class="split-list section"><div class="row"><span>Chance higher</span><strong class="${regimeClass}">${directional.available ? `${selectedProbability}%` : "N/A"}</strong></div><div class="row"><span>Expected swing</span><strong>${directional.available ? `+/-${selectedSwing}%` : "N/A"}</strong></div><div class="row"><span>Current regime</span><strong class="${regimeClass}">${regime}</strong></div></div>${directional.available ? "" : `<p class="subtle section">Candle history from Finnhub or Yahoo Finance is required before this model can calculate a result.</p>`}`
+      body: `<p>The ${horizon} estimate for ${ticker} blends its moving-average trend, 20-session momentum, RSI, and realized volatility from verified ${escapeHtml(marketData.candles[ticker]?.provider || "market")} candles.</p><div class="split-list section"><div class="row"><span>Chance higher</span><strong class="${regimeClass}">${directional.available ? `${selectedProbability}%` : "N/A"}</strong></div><div class="row"><span>Expected swing</span><strong>${directional.available ? `+/-${selectedSwing}%` : "N/A"}</strong></div><div class="row"><span>Current regime</span><strong class="${regimeClass}">${regime}</strong></div></div>${directional.available ? "" : `<p class="subtle section">Candle history from Alpha Vantage or Stooq is required before this model can calculate a result.</p>`}`
     },
     "price-action": {
       title: "Price action details",
@@ -1480,11 +1519,11 @@ function openDetail(kind) {
     },
     "fundamentals": {
       title: "Fundamentals & trend",
-      body: `<p>${ticker} is classified under ${s.sector || "N/A"} / ${s.industry || "N/A"}. Fundamentals below are returned by Finnhub.</p><div class="grid cols-3 section"><div class="stat"><div class="metric">Revenue TTM</div><strong>${company.revenue}</strong></div><div class="stat"><div class="metric">P/E TTM</div><strong>${company.pe}</strong></div><div class="stat"><div class="metric">EPS TTM</div><strong>${s.eps ? fmt(s.eps) : "N/A"}</strong></div><div class="stat"><div class="metric">5Y EPS Growth</div><strong>${Number.isFinite(s.growth) ? `${s.growth.toFixed(1)}%` : "N/A"}</strong></div><div class="stat"><div class="metric">Trend</div><strong class="${trend.className}">${trend.label}${Number.isFinite(trend.score) ? ` - ${trend.score}%` : ""}</strong></div><div class="stat"><div class="metric">TSI (25,13)</div><strong class="${Number.isFinite(technical.tsi) ? technical.tsi >= 10 ? "green" : technical.tsi <= -10 ? "red" : "amber" : ""}">${Number.isFinite(technical.tsi) ? technical.tsi.toFixed(1) : "N/A"}</strong><p class="muted">${tsiState}</p></div></div>`
+      body: `<p>${ticker} is classified under ${s.sector || "N/A"} / ${s.industry || "N/A"}. Fundamentals below are returned by Alpha Vantage.</p><div class="grid cols-3 section"><div class="stat"><div class="metric">Revenue TTM</div><strong>${company.revenue}</strong></div><div class="stat"><div class="metric">P/E TTM</div><strong>${company.pe}</strong></div><div class="stat"><div class="metric">EPS TTM</div><strong>${s.eps ? fmt(s.eps) : "N/A"}</strong></div><div class="stat"><div class="metric">5Y EPS Growth</div><strong>${Number.isFinite(s.growth) ? `${s.growth.toFixed(1)}%` : "N/A"}</strong></div><div class="stat"><div class="metric">Trend</div><strong class="${trend.className}">${trend.label}${Number.isFinite(trend.score) ? ` - ${trend.score}%` : ""}</strong></div><div class="stat"><div class="metric">TSI (25,13)</div><strong class="${Number.isFinite(technical.tsi) ? technical.tsi >= 10 ? "green" : technical.tsi <= -10 ? "red" : "amber" : ""}">${Number.isFinite(technical.tsi) ? technical.tsi.toFixed(1) : "N/A"}</strong><p class="muted">${tsiState}</p></div></div>`
     },
     "earnings": {
       title: "Earnings reports",
-      body: `<p>Finnhub quarterly EPS actuals and estimates for ${ticker}.</p><table class="table section"><thead><tr><th>Period</th><th>Actual EPS</th><th>Estimate</th><th>Surprise</th></tr></thead><tbody>${earningsRows.map(row => `<tr><td>${escapeHtml(String(row.period || `${row.year || ""} Q${row.quarter || ""}`))}</td><td>${fmt(Number(row.actual))}</td><td>${fmt(Number(row.estimate))}</td><td>${Number.isFinite(Number(row.surprise)) ? Number(row.surprise).toFixed(2) : "N/A"}</td></tr>`).join("")}</tbody></table>`
+      body: `<p>Alpha Vantage quarterly EPS actuals and estimates for ${ticker}.</p><table class="table section"><thead><tr><th>Period</th><th>Actual EPS</th><th>Estimate</th><th>Surprise</th></tr></thead><tbody>${earningsRows.map(row => `<tr><td>${escapeHtml(String(row.period || `${row.year || ""} Q${row.quarter || ""}`))}</td><td>${fmt(Number(row.actual))}</td><td>${fmt(Number(row.estimate))}</td><td>${Number.isFinite(Number(row.surprise)) ? Number(row.surprise).toFixed(2) : "N/A"}</td></tr>`).join("")}</tbody></table>`
     },
     "target-probability": {
       title: "Price target probability",
@@ -1643,6 +1682,7 @@ async function sendChatMessage(message) {
   const sendButton = document.querySelector("#chat-send");
   if (sendButton) sendButton.disabled = true;
   let answer = "";
+  let fallbackReason = "";
   const provider = "Market Copilot";
   try {
     const response = await fetch("/api/ai/chat", {
@@ -1650,11 +1690,13 @@ async function sendChatMessage(message) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: cleanMessage, history: priorHistory, context: compactAssistantContext() })
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
+    if (data.configured === false) throw new Error("Live AI is not configured for this deployment");
     if (!response.ok || !data.answer) throw new Error(data.error || "AI service unavailable");
     answer = data.answer;
-  } catch {
-    answer = assistantReply(cleanMessage);
+  } catch (error) {
+    fallbackReason = error?.message || "AI service unavailable";
+    answer = assistantReply(cleanMessage, { fallbackReason });
   }
   typing?.remove();
   log.insertAdjacentHTML("beforeend", `<p class="chat-ai"><strong>${escapeHtml(provider)}</strong><span>${escapeHtml(answer)}</span></p>`);
@@ -1680,7 +1722,7 @@ function assistantContext() {
   return { stock, technical, directional, company, diagnostics, candle, newsItems, atrDistance, rsiState, trend50, trend200 };
 }
 
-function assistantReply(rawMessage) {
+function assistantReply(rawMessage, options = {}) {
   const message = String(rawMessage || "").trim();
   const lower = message.toLowerCase();
   const ctx = assistantContext();
@@ -1692,9 +1734,10 @@ function assistantReply(rawMessage) {
   const maLine = `Technicals: price ${Number.isFinite(trend50) ? `${trend50 >= 0 ? "above" : "below"} SMA50 by ${Math.abs(trend50).toFixed(2)}%` : "needs SMA50"}, RSI ${Number.isFinite(technical.rsi) ? technical.rsi.toFixed(1) : "N/A"} (${rsiState}), 20-session momentum ${Number.isFinite(technical.momentum20) ? pct(technical.momentum20) : "N/A"}, ATR distance ${Number.isFinite(atrDistance) ? atrDistance.toFixed(2) : "N/A"} from the 50 MA.`;
   const probabilityLine = directional.available
     ? `Probability model: ${prob}% chance higher over ${horizon}, with about +/-${swing}% expected swing.`
-    : "Probability model: unavailable until Finnhub or Yahoo Finance candle history is returned for this ticker.";
+    : "Probability model: unavailable until Alpha Vantage or Stooq candle history is returned for this ticker.";
   const fundamentalLine = `Fundamentals: revenue ${company.revenue}, P/E ${company.pe}, EPS ${stock.eps ? fmt(stock.eps) : "N/A"}, 5Y EPS growth ${Number.isFinite(stock.growth) ? `${stock.growth.toFixed(1)}%` : "N/A"}.`;
   const newsLine = newsItems.length ? `Recent headlines I see: ${newsItems.join(" / ")}.` : "Recent news is not loaded yet for this ticker.";
+  const offlineNote = options.fallbackReason ? `\n\nNote: live generative AI is unavailable right now (${options.fallbackReason}), so I am using the app's loaded ${ticker} quote, chart, fundamentals, probability, and news context.` : "";
   const bullish = [
     Number.isFinite(trend50) && trend50 > 0 ? `price is above the 50 MA by ${trend50.toFixed(2)}%` : "",
     Number.isFinite(technical.sma20) && Number.isFinite(technical.sma50) && technical.sma20 > technical.sma50 ? "20 MA is above the 50 MA" : "",
@@ -1715,7 +1758,7 @@ function assistantReply(rawMessage) {
     answer = `Because the last read was driven by these inputs: ${maLine} ${probabilityLine} The stronger pieces are ${bullish.join(", ") || "limited right now"}; the caution points are ${bearish.join(", ") || "mostly muted"}.`;
   } else if (/data|api|provider|live|delay|stale|key|token/.test(lower)) {
     lastAssistantTopic = "data";
-    answer = `${dataLine} Quotes and streaming updates use Finnhub first through the backend. Historical OHLC candles and volume fall back to Yahoo Finance when Finnhub is unavailable. If every live provider is unreachable, the app marks temporary offline demo data clearly so the interface stays usable.`;
+    answer = `${dataLine} Quotes and historical OHLC candles use Alpha Vantage first through the backend. Google Finance quotes and Stooq daily candles are fallback sources when Alpha Vantage is unavailable. If every live provider is unreachable, the app marks temporary offline demo data clearly so the interface stays usable.`;
   } else if (/earn|eps|revenue|fundamental|pe|p\/e/.test(lower) || message === "Earnings Summary") {
     lastAssistantTopic = "earnings";
     answer = `${fundamentalLine} In the Earnings Reports panel, use Revenue/EPS plus Show/Hide Estimates to separate actuals from forward estimates. I would compare EPS trend against revenue trend: EPS rising faster than revenue can mean margin expansion, while revenue rising faster than EPS can mean cost pressure.`;
@@ -1742,7 +1785,7 @@ function assistantReply(rawMessage) {
     lastAssistantTopic = "analysis";
     answer = `${ticker} snapshot: ${stock.name} trades at ${fmt(stock.price)} (${pct(stock.pct)} today). ${probabilityLine} ${maLine} My quick read: ${prob >= 55 ? "constructive but still confirm with trend and earnings" : prob <= 45 ? "cautious until trend improves" : "mixed/neutral, so wait for cleaner confirmation"}.`;
   }
-  return answer;
+  return `${answer}${offlineNote}`;
 }
 
 function drawCharts() {
@@ -1804,12 +1847,12 @@ function drawPriceChart() {
   if (candles.length < 2) return;
   const isLight = document.documentElement.dataset.theme === "light";
   const colors = {
-    text: isLight ? "#59687b" : "#9aa8bd", grid: isLight ? "rgba(82,97,116,.14)" : "rgba(148,163,184,.10)",
+    text: isLight ? "#59687b" : "#a7adba", grid: isLight ? "rgba(82,97,116,.14)" : "rgba(148,163,184,.095)",
     gold: "#d8a93f", goldSoft: "#e0bc69", blue: "#3aa0d8", up: "#36d399", down: "#fb7185"
   };
-  const pad = { left: 8, right: 64, top: 18, bottom: 34 };
-  const volumeHeight = chartIndicators.volume ? 74 : 0;
-  const priceBottom = h - pad.bottom - volumeHeight - (volumeHeight ? 12 : 0);
+  const pad = { left: 20, right: 70, top: 16, bottom: 36 };
+  const volumeHeight = chartIndicators.volume ? 82 : 0;
+  const priceBottom = h - pad.bottom - volumeHeight - (volumeHeight ? 6 : 0);
   const scaleValues = candles.flatMap(row => [row.low, row.high]);
   Object.entries(averages).forEach(([key, values]) => { if (chartIndicators[key]) scaleValues.push(...values.filter(Number.isFinite)); });
   const rawMin = Math.min(...scaleValues), rawMax = Math.max(...scaleValues), spread = Math.max(rawMax - rawMin, Math.abs(rawMax) * .015, 1);
@@ -1818,6 +1861,11 @@ function drawPriceChart() {
   const x = index => pad.left + index * plotWidth / Math.max(1, candles.length - 1);
   const y = value => pad.top + (max - value) / (max - min) * (priceBottom - pad.top);
   ctx.clearRect(0, 0, w, h);
+  const bg = ctx.createLinearGradient(0, 0, 0, h);
+  bg.addColorStop(0, isLight ? "#f8fafc" : "#0e1524");
+  bg.addColorStop(1, isLight ? "#eef2f7" : "#080d18");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
   ctx.font = "11px ui-monospace, SFMono-Regular, Consolas, monospace";
   for (let index = 0; index < 5; index++) {
     const value = max - index * (max - min) / 4, yy = y(value);
@@ -1830,7 +1878,7 @@ function drawPriceChart() {
     const barWidth = Math.max(1, Math.min(8, plotWidth / candles.length * .68));
     candles.forEach((row, index) => {
       const height = row.volume / maxVolume * (volumeBottom - volumeTop);
-      ctx.fillStyle = row.close >= row.open ? "rgba(54,211,153,.28)" : "rgba(251,113,133,.28)";
+      ctx.fillStyle = "rgba(125,132,147,.30)";
       ctx.fillRect(x(index) - barWidth / 2, volumeBottom - height, barWidth, height);
     });
   }
@@ -1838,11 +1886,11 @@ function drawPriceChart() {
     ctx.beginPath(); candles.forEach((row, index) => index ? ctx.lineTo(x(index), y(row.close)) : ctx.moveTo(x(index), y(row.close)));
     if (fill) {
       ctx.lineTo(x(candles.length - 1), priceBottom); ctx.lineTo(x(0), priceBottom); ctx.closePath();
-      const gradient = ctx.createLinearGradient(0, pad.top, 0, priceBottom); gradient.addColorStop(0, "rgba(216,169,63,.28)"); gradient.addColorStop(1, "rgba(216,169,63,0)");
+      const gradient = ctx.createLinearGradient(0, pad.top, 0, priceBottom); gradient.addColorStop(0, "rgba(216,169,63,.34)"); gradient.addColorStop(.55, "rgba(216,169,63,.12)"); gradient.addColorStop(1, "rgba(216,169,63,0)");
       ctx.fillStyle = gradient; ctx.fill();
       ctx.beginPath(); candles.forEach((row, index) => index ? ctx.lineTo(x(index), y(row.close)) : ctx.moveTo(x(index), y(row.close)));
     }
-    ctx.strokeStyle = colors.gold; ctx.lineWidth = 2; ctx.stroke();
+    ctx.strokeStyle = colors.gold; ctx.lineWidth = 2.3; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.stroke();
   };
   if (priceChartMode === "candles") {
     const bodyWidth = Math.max(1, Math.min(9, plotWidth / candles.length * .64));
@@ -1861,10 +1909,15 @@ function drawPriceChart() {
   if (chartIndicators.ma10) drawAverage(averages.ma10, colors.gold, 1, [3, 4]);
   if (chartIndicators.ma20) drawAverage(averages.ma20, colors.goldSoft, 1.3, [5, 4]);
   if (chartIndicators.ma50) drawAverage(averages.ma50, colors.blue, 1.7);
-  const labelCount = Math.min(7, candles.length), labelIndexes = Array.from({ length: labelCount }, (_, index) => Math.round(index * (candles.length - 1) / Math.max(1, labelCount - 1)));
+  const labelCount = Math.min(["1D","5D"].includes(chartRange) ? 6 : chartRange === "1M" ? 7 : 8, candles.length);
+  const labelIndexes = Array.from({ length: labelCount }, (_, index) => Math.round(index * (candles.length - 1) / Math.max(1, labelCount - 1)));
   labelIndexes.forEach((candleIndex, index) => {
     const date = new Date(candles[candleIndex].time * 1000);
-    const label = ["1D","5D"].includes(chartRange) ? date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : chartRange === "1M" ? date.toLocaleDateString([], { month: "short", day: "numeric" }) : date.toLocaleDateString([], { month: "short", year: "2-digit" });
+    const label = ["1D","5D"].includes(chartRange)
+      ? date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+      : ["1M","6M","YTD"].includes(chartRange)
+        ? date.toISOString().slice(5, 10)
+        : date.toLocaleDateString([], { month: "short", year: "2-digit" });
     ctx.fillStyle = colors.text; ctx.textAlign = index === 0 ? "left" : index === labelIndexes.length - 1 ? "right" : "center"; ctx.fillText(label, x(candleIndex), h - 9);
   });
   enableChartCrosshair(canvas, drawPriceChart, pad, ratio => {
@@ -1899,17 +1952,24 @@ function drawMacroIndicators() {
   const rangeDays = { "6M": 190, "1Y": 380, "2Y": 750, "5Y": 1840, "10Y": 3670 };
   Object.entries(marketData.macro.data?.series || {}).forEach(([id, series]) => {
     const chart = setupCanvas(`macro-${id}`); if (!chart || !series.rows?.length) return;
-    const cutoff = new Date(series.rows.at(-1).date).getTime() - rangeDays[macroRanges[id]] * 86400000;
-    const rows = series.rows.filter(row => new Date(row.date).getTime() >= cutoff && Number.isFinite(Number(row.value)));
+    const latestDate = new Date(`${series.rows.at(-1).date}T00:00:00Z`).getTime();
+    const cutoff = latestDate - rangeDays[macroRanges[id]] * 86400000;
+    const rows = series.rows.filter(row => new Date(`${row.date}T00:00:00Z`).getTime() >= cutoff && Number.isFinite(Number(row.value)));
     if (rows.length < 2) return;
-    const {ctx,w,h}=chart,pad={left:8,right:44,top:18,bottom:28},values=rows.map(row=>Number(row.value));
-    const rawMin=Math.min(...values),rawMax=Math.max(...values),margin=Math.max(.04,(rawMax-rawMin)*.12);
-    const min=rawMin>=0?Math.max(0,rawMin-margin):rawMin-margin,max=Math.max(rawMax+margin,min+.1);
+    const {ctx,w,h}=chart,pad={left:10,right:52,top:18,bottom:32},values=rows.map(row=>Number(row.value));
+    const rawMin=Math.min(...values),rawMax=Math.max(...values),range=Math.max(.08,rawMax-rawMin),margin=Math.max(.08,range*.18);
+    const min = ["unemployment","fed","treasury"].includes(id) ? Math.max(0, rawMin - margin) : rawMin >= 0 ? Math.max(0, rawMin - margin) : rawMin - margin;
+    const max=Math.max(rawMax+margin,min+.1);
     const x=i=>pad.left+i*(w-pad.left-pad.right)/(rows.length-1),y=value=>pad.top+(max-value)/(max-min)*(h-pad.top-pad.bottom);
+    const bg=ctx.createLinearGradient(0,0,0,h);bg.addColorStop(0,"#0f1728");bg.addColorStop(1,"#080d18");ctx.fillStyle=bg;ctx.fillRect(0,0,w,h);
     ctx.font="10px ui-monospace, SFMono-Regular, Consolas, monospace";
-    for(let i=0;i<3;i++){const value=max-i*(max-min)/2,yy=y(value);ctx.strokeStyle="rgba(148,163,184,.12)";ctx.setLineDash([3,5]);ctx.beginPath();ctx.moveTo(pad.left,yy);ctx.lineTo(w-pad.right,yy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle="#8f98aa";ctx.textAlign="left";ctx.fillText(value.toFixed(2),w-pad.right+7,yy+3);}
-    ctx.beginPath();values.forEach((value,index)=>index?ctx.lineTo(x(index),y(value)):ctx.moveTo(x(index),y(value)));ctx.strokeStyle="#d6aa4b";ctx.lineWidth=2;ctx.stroke();
-    const labels=[0,Math.floor((rows.length-1)/2),rows.length-1];ctx.fillStyle="#8f98aa";labels.forEach((index,labelIndex)=>{ctx.textAlign=labelIndex===0?"left":labelIndex===2?"right":"center";ctx.fillText(new Date(`${rows[index].date}T00:00:00Z`).toLocaleDateString([],{month:"short",year:"2-digit",timeZone:"UTC"}),x(index),h-8);});
+    for(let i=0;i<4;i++){const value=max-i*(max-min)/3,yy=y(value);ctx.strokeStyle="rgba(148,163,184,.12)";ctx.setLineDash([3,5]);ctx.beginPath();ctx.moveTo(pad.left,yy);ctx.lineTo(w-pad.right,yy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle="#a3a8b3";ctx.textAlign="left";ctx.fillText(value.toFixed(2),w-pad.right+7,yy+3);}
+    ctx.beginPath();values.forEach((value,index)=>index?ctx.lineTo(x(index),y(value)):ctx.moveTo(x(index),y(value)));
+    ctx.lineTo(x(values.length-1),h-pad.bottom);ctx.lineTo(x(0),h-pad.bottom);ctx.closePath();
+    const fill=ctx.createLinearGradient(0,pad.top,0,h-pad.bottom);fill.addColorStop(0,"rgba(214,170,75,.24)");fill.addColorStop(1,"rgba(214,170,75,0)");ctx.fillStyle=fill;ctx.fill();
+    ctx.beginPath();values.forEach((value,index)=>index?ctx.lineTo(x(index),y(value)):ctx.moveTo(x(index),y(value)));ctx.strokeStyle="#d6aa4b";ctx.lineWidth=2.15;ctx.lineJoin="round";ctx.lineCap="round";ctx.stroke();
+    const labelCount=Math.min(4,rows.length),labels=Array.from({length:labelCount},(_,index)=>Math.round(index*(rows.length-1)/Math.max(1,labelCount-1)));
+    ctx.fillStyle="#a3a8b3";labels.forEach((rowIndex,labelIndex)=>{ctx.textAlign=labelIndex===0?"left":labelIndex===labels.length-1?"right":"center";ctx.fillText(new Date(`${rows[rowIndex].date}T00:00:00Z`).toLocaleDateString([],{month:"short",year:"2-digit",timeZone:"UTC"}),x(rowIndex),h-9);});
     enableChartCrosshair(document.getElementById(`macro-${id}`),drawMacroIndicators,pad,ratio=>{const index=Math.max(0,Math.min(rows.length-1,Math.round(ratio*(rows.length-1)))),row=rows[index];return `<span>${row.date}</span><b>${escapeHtml(series.name)} ${Number(row.value).toFixed(2)}%</b><em>FRED ${escapeHtml(series.id)}</em>`;});
   });
 }
@@ -2333,7 +2393,7 @@ function render() {
   else if (r === "/paper") paper();
   else if (r === "/world-chat") worldChat();
   else dashboard();
-  if ((r === "/" || r === "/news") && !marketData.loading && !marketData.liveSymbols.has(ticker)) refreshTickerData(ticker);
+  if ((r === "/" || r === "/news") && !marketData.loading && stockNeedsRefresh(ticker)) refreshTickerData(ticker);
   if (r === "/") refreshWatchlistData();
   if (r === "/sentiment" && !marketData.cnn.loading && !marketData.cnn.data) refreshCnnSentiment();
   if (r === "/macro") refreshMacroData();

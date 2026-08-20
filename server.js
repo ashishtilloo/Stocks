@@ -132,28 +132,59 @@ function demoNews(symbol) {
   ];
 }
 
-function demoMacroRows(startYear, endYear, base, amplitude, trend = 0) {
+function monthIndex(date) {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  return parsed.getUTCFullYear() * 12 + parsed.getUTCMonth();
+}
+
+function monthDate(index) {
+  return `${Math.floor(index / 12)}-${String(index % 12 + 1).padStart(2, "0")}-01`;
+}
+
+function anchoredMacroRows(anchors, latestDate = "2026-06-01") {
+  const sorted = anchors.map(([date, value]) => ({ date, value: Number(value), index: monthIndex(date) })).sort((a, b) => a.index - b.index);
   const rows = [];
-  const now = new Date();
-  for (let year = startYear; year <= endYear; year++) {
-    for (let month = 0; month < 12; month++) {
-      if (year === now.getFullYear() && month > now.getMonth()) break;
-      const index = (year - startYear) * 12 + month;
-      const value = Math.max(0, base + Math.sin(index / 11) * amplitude + Math.cos(index / 29) * amplitude * 0.45 + trend * index);
-      rows.push({ date: `${year}-${String(month + 1).padStart(2, "0")}-01`, value: Number(value.toFixed(2)) });
+  const start = sorted[0].index, end = monthIndex(latestDate);
+  for (let index = start; index <= end; index++) {
+    let left = sorted[0], right = sorted.at(-1);
+    for (let anchorIndex = 1; anchorIndex < sorted.length; anchorIndex++) {
+      if (index <= sorted[anchorIndex].index) {
+        left = sorted[anchorIndex - 1];
+        right = sorted[anchorIndex];
+        break;
+      }
     }
+    const span = Math.max(1, right.index - left.index);
+    const progress = Math.max(0, Math.min(1, (index - left.index) / span));
+    const cycle = Math.sin(index / 5.7) * 0.035 + Math.cos(index / 13.3) * 0.025;
+    const value = left.value + (right.value - left.value) * progress + cycle;
+    rows.push({ date: monthDate(index), value: Number(Math.max(0, value).toFixed(2)) });
   }
   return rows;
 }
 
 function demoMacroIndicators() {
-  const endYear = new Date().getFullYear();
-  const unemploymentRows = demoMacroRows(1985, endYear, 5.1, 1.1, -0.001);
-  unemploymentRows.push({ date: "2020-04-01", value: 14.7 });
-  unemploymentRows.sort((a, b) => a.date.localeCompare(b.date));
-  const inflationRows = demoMacroRows(1985, endYear, 3.1, 1.4, 0.0005);
-  const fedRows = demoMacroRows(1985, endYear, 3.8, 2.1, -0.0015);
-  const treasuryRows = demoMacroRows(1985, endYear, 4.6, 1.3, -0.001);
+  const unemploymentRows = anchoredMacroRows([
+    ["1985-01-01", 7.3], ["1989-03-01", 5.0], ["1992-06-01", 7.8], ["2000-04-01", 3.8],
+    ["2003-06-01", 6.3], ["2007-05-01", 4.4], ["2009-10-01", 10.0], ["2015-12-01", 5.0],
+    ["2019-12-01", 3.6], ["2020-04-01", 14.7], ["2021-12-01", 3.9], ["2023-04-01", 3.4],
+    ["2024-12-01", 4.1], ["2026-05-01", 4.3]
+  ], "2026-05-01");
+  const inflationRows = anchoredMacroRows([
+    ["1985-01-01", 3.5], ["1991-01-01", 5.6], ["1998-06-01", 1.7], ["2008-07-01", 5.6],
+    ["2009-07-01", 0.0], ["2015-01-01", 0.1], ["2019-12-01", 2.3], ["2022-06-01", 9.1],
+    ["2023-12-01", 3.3], ["2025-05-01", 2.31], ["2026-05-01", 4.47]
+  ], "2026-05-01");
+  const fedRows = anchoredMacroRows([
+    ["1985-01-01", 8.4], ["1992-09-01", 3.0], ["2000-07-01", 6.5], ["2003-06-01", 1.0],
+    ["2007-08-01", 5.25], ["2009-01-01", 0.16], ["2015-12-01", 0.24], ["2019-07-01", 2.4],
+    ["2021-12-01", 0.08], ["2023-08-01", 5.33], ["2025-06-01", 4.33], ["2026-06-01", 3.63]
+  ], "2026-06-01");
+  const treasuryRows = anchoredMacroRows([
+    ["1985-01-01", 11.4], ["1993-10-01", 5.3], ["2000-01-01", 6.7], ["2003-06-01", 3.3],
+    ["2007-06-01", 5.1], ["2012-07-01", 1.5], ["2018-11-01", 3.2], ["2020-08-01", 0.6],
+    ["2022-10-01", 4.1], ["2023-10-01", 4.9], ["2025-06-01", 4.21], ["2026-06-01", 4.45]
+  ], "2026-06-01");
   return { provider: "Demo fallback (offline)", fetchedAt: new Date().toISOString(), series: {
     unemployment: macroSeriesSummary("UNRATE", "Unemployment Rate", "Monthly", "%", unemploymentRows),
     inflation: macroSeriesSummary("CPIAUCSL", "Inflation (CPI YoY)", "Monthly, year-over-year", "%", inflationRows),
@@ -275,7 +306,7 @@ function worldChatPresence() {
 async function geminiChat(payload) {
   const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!key) throw new Error("Gemini is not configured");
-  const model = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
   const message = String(payload?.message || "").trim().slice(0, 4000);
   if (!message) throw new Error("A message is required");
   const history = Array.isArray(payload?.history) ? payload.history.slice(-8) : [];
@@ -302,18 +333,27 @@ async function geminiChat(payload) {
   return { answer, provider: "Market Copilot", model };
 }
 
-async function finnhub(endpoint, params, ttlMs) {
-  const key = process.env.FINNHUB_API_KEY;
-  if (!key) throw new Error("FINNHUB_API_KEY is not configured");
-  const url = new URL(`https://finnhub.io/api/v1/${endpoint}`);
+function alphaVantageKey() {
+  return process.env.ALPHA_VANTAGE_API_KEY || process.env.ALPHAVANTAGE_API_KEY;
+}
+
+function alphaVantageSymbol(symbol) {
+  return ({ "^GSPC": "SPY", "^DJI": "DIA", "^IXIC": "QQQ" })[symbol] || symbol;
+}
+
+async function alphaVantage(params, ttlMs) {
+  const key = alphaVantageKey();
+  if (!key) throw new Error("ALPHA_VANTAGE_API_KEY is not configured");
+  const url = new URL("https://www.alphavantage.co/query");
   Object.entries(params).forEach(([name, value]) => url.searchParams.set(name, String(value)));
-  url.searchParams.set("token", key);
+  url.searchParams.set("apikey", key);
   const cacheKey = url.toString().replace(key, "[key]");
   const cached = cache.get(cacheKey);
   if (cached && Date.now() - cached.time < ttlMs) return cached.data;
   const response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.error) throw new Error(data.error || `Finnhub request failed (${response.status})`);
+  const providerMessage = data["Error Message"] || data.Note || data.Information;
+  if (!response.ok || providerMessage) throw new Error(providerMessage || `Alpha Vantage request failed (${response.status})`);
   cache.set(cacheKey, { time: Date.now(), data });
   return data;
 }
@@ -335,67 +375,96 @@ function candleWindow(range) {
   return { ...settings, to: now };
 }
 
-function yahooInterval(resolution) {
-  return ({ "5": "5m", "15": "15m", "60": "60m", D: "1d", W: "1wk" })[resolution] || "1d";
+function alphaTimestampFromDate(date, intraday = false) {
+  return Math.floor(new Date(intraday ? `${date.replace(" ", "T")}:00Z` : `${date}T16:00:00Z`).getTime() / 1000);
 }
 
-async function yahooChart(symbol, range, ttlMs = 300000) {
+function alphaNumber(row, key) {
+  const value = Number(row?.[key]);
+  return Number.isFinite(value) ? value : null;
+}
+
+async function alphaVantageQuote(symbol, ttlMs = 60000) {
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const data = await alphaVantage({ function: "GLOBAL_QUOTE", symbol: sourceSymbol }, ttlMs);
+  const quote = data["Global Quote"] || {};
+  const current = alphaNumber(quote, "05. price");
+  const previous = alphaNumber(quote, "08. previous close");
+  if (!Number.isFinite(current) || current <= 0) throw new Error("Alpha Vantage returned no current quote");
+  const rawPercent = String(quote["10. change percent"] || "").replace("%", "");
+  const latestDay = quote["07. latest trading day"];
+  return {
+    c: current,
+    d: alphaNumber(quote, "09. change"),
+    dp: Number.isFinite(Number(rawPercent)) ? Number(rawPercent) : Number.isFinite(previous) && previous !== 0 ? (current / previous - 1) * 100 : null,
+    h: alphaNumber(quote, "03. high"),
+    l: alphaNumber(quote, "04. low"),
+    o: alphaNumber(quote, "02. open"),
+    pc: previous,
+    t: latestDay ? alphaTimestampFromDate(latestDay) : null,
+    provider: "Alpha Vantage"
+  };
+}
+
+function alphaSeriesKey(data) {
+  return Object.keys(data || {}).find(key => /Time Series/i.test(key));
+}
+
+async function alphaVantageChart(symbol, range, ttlMs = 300000) {
   const window = candleWindow(range);
-  const interval = yahooInterval(window.resolution);
-  const cacheKey = `yahoo:chart:${symbol}:${range}:${interval}`;
-  const cached = cache.get(cacheKey);
-  if (cached && Date.now() - cached.time < ttlMs) return cached.data;
-  const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
-  url.searchParams.set("period1", String(window.from));
-  url.searchParams.set("period2", String(window.to));
-  url.searchParams.set("interval", interval);
-  url.searchParams.set("includePrePost", "false");
-  url.searchParams.set("events", "div,splits");
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
-    },
-    signal: AbortSignal.timeout(10000)
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.chart?.error?.description || `Yahoo Finance request failed (${response.status})`);
-  const result = payload?.chart?.result?.[0];
-  const quote = result?.indicators?.quote?.[0];
-  if (!result || !Array.isArray(result.timestamp) || !quote) throw new Error(payload?.chart?.error?.description || "Yahoo Finance returned no chart history");
-  const rows = result.timestamp.map((time, index) => ({
-    time: Number(time),
-    open: Number(quote.open?.[index]),
-    high: Number(quote.high?.[index]),
-    low: Number(quote.low?.[index]),
-    close: Number(quote.close?.[index]),
-    volume: Number(quote.volume?.[index])
-  })).filter(row => Number.isFinite(row.time) && Number.isFinite(row.open) && Number.isFinite(row.high) && Number.isFinite(row.low) && Number.isFinite(row.close));
-  if (rows.length < 2) throw new Error("Yahoo Finance returned insufficient chart history");
-  const data = {
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const intraday = ["1D", "5D", "1M"].includes(range);
+  const interval = ({ "5": "5min", "15": "15min", "60": "60min" })[window.resolution] || "60min";
+  const data = await alphaVantage(intraday
+    ? { function: "TIME_SERIES_INTRADAY", symbol: sourceSymbol, interval, outputsize: "full", adjusted: "false" }
+    : { function: "TIME_SERIES_DAILY_ADJUSTED", symbol: sourceSymbol, outputsize: "full" }, ttlMs);
+  const series = data[alphaSeriesKey(data)];
+  if (!series || typeof series !== "object") throw new Error("Alpha Vantage returned no chart history");
+  const rows = Object.entries(series).map(([date, row]) => ({
+    time: alphaTimestampFromDate(date, intraday),
+    open: alphaNumber(row, "1. open"),
+    high: alphaNumber(row, "2. high"),
+    low: alphaNumber(row, "3. low"),
+    close: alphaNumber(row, intraday ? "4. close" : "5. adjusted close") ?? alphaNumber(row, "4. close"),
+    volume: alphaNumber(row, intraday ? "5. volume" : "6. volume") ?? 0
+  })).filter(row => row.time >= window.from && row.time <= window.to && [row.time, row.open, row.high, row.low, row.close].every(Number.isFinite))
+    .sort((a, b) => a.time - b.time);
+  if (rows.length < 2) {
+    throw new Error("Alpha Vantage returned insufficient chart history for this range");
+  }
+  return {
     s: "ok",
     t: rows.map(row => row.time),
     o: rows.map(row => row.open),
     h: rows.map(row => row.high),
     l: rows.map(row => row.low),
     c: rows.map(row => row.close),
-    v: rows.map(row => Number.isFinite(row.volume) ? row.volume : 0),
-    meta: result.meta || {},
+    v: rows.map(row => row.volume),
+    meta: { regularMarketPrice: rows.at(-1).close, chartPreviousClose: rows.at(-2).close },
     symbol,
+    sourceSymbol,
     range,
     displayFrom: window.displayFrom,
     resolution: window.resolution,
-    provider: "Yahoo Finance fallback",
+    provider: sourceSymbol === symbol ? "Alpha Vantage" : `Alpha Vantage (${sourceSymbol} proxy)`,
     fetchedAt: new Date().toISOString()
   };
-  cache.set(cacheKey, { time: Date.now(), data });
-  return data;
 }
 
-function yahooQuote(chart) {
+function rangeDisplayFrom(range, latestTime) {
+  const latest = Number(latestTime) || Math.floor(Date.now() / 1000);
+  if (range === "YTD") {
+    const date = new Date(latest * 1000);
+    return Math.floor(Date.UTC(date.getUTCFullYear(), 0, 1) / 1000);
+  }
+  const days = ({ "1D": 1, "5D": 5, "1M": 31, "6M": 183, "1Y": 365, "5Y": 365 * 5, "10Y": 365 * 10 })[range] || 183;
+  return latest - days * 86400;
+}
+
+function chartQuote(chart) {
   const meta = chart?.meta || {};
   const current = Number(meta.regularMarketPrice ?? chart?.c?.at(-1));
-  const previous = Number(meta.chartPreviousClose ?? meta.previousClose);
+  const previous = Number(meta.chartPreviousClose ?? meta.previousClose ?? chart?.c?.at(-2));
   return {
     c: current,
     d: Number.isFinite(current) && Number.isFinite(previous) ? current - previous : null,
@@ -405,13 +474,260 @@ function yahooQuote(chart) {
     o: Number(meta.regularMarketOpen),
     pc: previous,
     t: Number(meta.regularMarketTime),
-    provider: "Yahoo Finance fallback"
+    provider: chart?.provider || "Market data"
   };
 }
 
+function googleFinanceCandidates(symbol) {
+  const map = {
+    "^GSPC": [".INX:INDEXSP"],
+    "^DJI": [".DJI:INDEXDJX"],
+    "^IXIC": [".IXIC:INDEXNASDAQ"],
+    SPY: ["SPY:NYSEARCA"],
+    QQQ: ["QQQ:NASDAQ"],
+    IWM: ["IWM:NYSEARCA"],
+    DIA: ["DIA:NYSEARCA"]
+  };
+  if (map[symbol]) return map[symbol];
+  const nasdaq = new Set(["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "GOOG", "AMD", "NFLX", "INTC", "COST", "ADBE", "AVGO", "PEP", "CSCO", "CMCSA", "TMUS"]);
+  const exchanges = nasdaq.has(symbol) ? ["NASDAQ", "NYSE", "NYSEARCA"] : ["NYSE", "NASDAQ", "NYSEARCA"];
+  return exchanges.map(exchange => `${symbol}:${exchange}`);
+}
+
+function parseGoogleNumber(value) {
+  const cleaned = String(value || "").replace(/&amp;/g, "&").replace(/[^\d.+-]/g, "");
+  const number = Number(cleaned);
+  return Number.isFinite(number) ? number : null;
+}
+
+async function googleFinanceQuote(symbol, ttlMs = 60000) {
+  const cacheKey = `google:quote:${symbol}`;
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.time < ttlMs) return cached.data;
+  let lastError = null;
+  for (const candidate of googleFinanceCandidates(symbol)) {
+    try {
+      const encodedCandidate = candidate.split(":").map(encodeURIComponent).join(":");
+      const response = await fetch(`https://www.google.com/finance/quote/${encodedCandidate}`, {
+        headers: {
+          Accept: "text/html,application/xhtml+xml",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+      const html = await response.text();
+      if (!response.ok) throw new Error(`Google Finance request failed (${response.status})`);
+      const current = parseGoogleNumber(html.match(/data-last-price="([^"]+)"/)?.[1])
+        ?? parseGoogleNumber(html.match(/class="YMlKec fxKbKc">([^<]+)</)?.[1]);
+      if (!Number.isFinite(current)) throw new Error("Google Finance returned no current price");
+      const previous = parseGoogleNumber(html.match(/data-previous-close="([^"]+)"/)?.[1]);
+      const timestamp = Number(html.match(/data-last-normal-market-timestamp-sec="([^"]+)"/)?.[1]);
+      const data = {
+        c: current,
+        d: Number.isFinite(previous) ? current - previous : null,
+        dp: Number.isFinite(previous) && previous !== 0 ? (current / previous - 1) * 100 : null,
+        h: null,
+        l: null,
+        o: null,
+        pc: Number.isFinite(previous) ? previous : null,
+        t: Number.isFinite(timestamp) ? timestamp : null,
+        provider: "Google Finance"
+      };
+      cache.set(cacheKey, { time: Date.now(), data });
+      return data;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(lastError?.message || "Google Finance quote unavailable");
+}
+
+function yyyymmdd(timestamp) {
+  const date = new Date(Number(timestamp) * 1000);
+  return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, "0")}${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+function stooqSymbol(symbol) {
+  const map = { "^GSPC": "^spx", "^DJI": "^dji", "^IXIC": "^ndq", SPY: "spy.us", QQQ: "qqq.us" };
+  if (map[symbol]) return map[symbol];
+  if (symbol.startsWith("^")) return symbol.toLowerCase();
+  return symbol.includes(".") ? symbol.toLowerCase() : `${symbol.toLowerCase()}.us`;
+}
+
+function parseCsvLine(line) {
+  const fields = [];
+  let field = "", quoted = false;
+  for (const char of String(line || "")) {
+    if (char === "\"") quoted = !quoted;
+    else if (char === "," && !quoted) { fields.push(field); field = ""; }
+    else field += char;
+  }
+  fields.push(field);
+  return fields.map(value => value.trim().replace(/^"|"$/g, ""));
+}
+
+async function stooqChart(symbol, range, ttlMs = 300000) {
+  const window = candleWindow(range);
+  const stooqTicker = stooqSymbol(symbol);
+  const cacheKey = `stooq:chart:${stooqTicker}:${range}`;
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.time < ttlMs) return cached.data;
+  const url = new URL("https://stooq.com/q/d/l/");
+  url.searchParams.set("s", stooqTicker);
+  url.searchParams.set("d1", yyyymmdd(window.from));
+  url.searchParams.set("d2", yyyymmdd(window.to));
+  url.searchParams.set("i", "d");
+  if (process.env.STOOQ_API_KEY) url.searchParams.set("apikey", process.env.STOOQ_API_KEY);
+  const response = await fetch(url, {
+    headers: {
+      Accept: "text/csv",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+    },
+    signal: AbortSignal.timeout(10000)
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Stooq request failed (${response.status})`);
+  if (/apikey|captcha|exceeded|no data/i.test(text)) throw new Error("Stooq did not return usable chart data");
+  const lines = text.trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 3) throw new Error("Stooq returned insufficient chart history");
+  const rows = lines.slice(1).map(line => {
+    const [date, open, high, low, close, volume] = parseCsvLine(line);
+    return {
+      time: Math.floor(new Date(`${date}T16:00:00Z`).getTime() / 1000),
+      open: Number(open), high: Number(high), low: Number(low), close: Number(close), volume: Number(volume) || 0
+    };
+  }).filter(row => [row.time, row.open, row.high, row.low, row.close].every(Number.isFinite));
+  if (rows.length < 2) throw new Error("Stooq returned insufficient valid OHLC rows");
+  const latestTime = rows.at(-1).time;
+  const data = {
+    s: "ok",
+    t: rows.map(row => row.time),
+    o: rows.map(row => row.open),
+    h: rows.map(row => row.high),
+    l: rows.map(row => row.low),
+    c: rows.map(row => row.close),
+    v: rows.map(row => row.volume),
+    meta: { regularMarketPrice: rows.at(-1).close, chartPreviousClose: rows.at(-2).close },
+    symbol,
+    range,
+    displayFrom: rangeDisplayFrom(range, latestTime),
+    resolution: "D",
+    provider: "Stooq",
+    fetchedAt: new Date().toISOString()
+  };
+  cache.set(cacheKey, { time: Date.now(), data });
+  return data;
+}
+
+async function marketChart(symbol, range, ttlMs = 60000) {
+  const diagnostics = [];
+  try {
+    const [candles, rawQuote] = await Promise.all([
+      alphaVantageChart(symbol, range, ttlMs),
+      alphaVantageQuote(symbol, 60000)
+    ]);
+    if (!Number.isFinite(Number(rawQuote?.c)) || Number(rawQuote.c) <= 0) throw new Error("Alpha Vantage returned candles but no current quote");
+    const quote = { ...rawQuote, provider: "Alpha Vantage" };
+    diagnostics.push({ provider: "Alpha Vantage", ok: true, authApplied: Boolean(alphaVantageKey()), message: "Quote, OHLC, and volume returned" });
+    return { candles, quote, diagnostics, provider: "Alpha Vantage" };
+  } catch (error) {
+    diagnostics.push({ provider: "Alpha Vantage", ok: false, authApplied: Boolean(alphaVantageKey()), message: error.message });
+  }
+
+  let googleQuote = null;
+  try {
+    googleQuote = await googleFinanceQuote(symbol, ttlMs);
+    diagnostics.push({ provider: "Google Finance", ok: true, authApplied: false, message: "Current quote returned" });
+  } catch (error) {
+    diagnostics.push({ provider: "Google Finance", ok: false, authApplied: false, message: error.message });
+  }
+
+  try {
+    const candles = await stooqChart(symbol, range, ttlMs);
+    diagnostics.push({ provider: "Stooq", ok: true, authApplied: Boolean(process.env.STOOQ_API_KEY), message: "Daily OHLC and volume returned" });
+    const quote = googleQuote || chartQuote(candles);
+    if (!Number.isFinite(Number(quote?.c))) throw new Error("Stooq returned history but no current quote");
+    return { candles, quote, diagnostics, provider: quote.provider === "Google Finance" ? "Google Finance + Stooq" : "Stooq" };
+  } catch (error) {
+    diagnostics.push({ provider: "Stooq", ok: false, authApplied: Boolean(process.env.STOOQ_API_KEY), message: error.message });
+  }
+
+  const detail = diagnostics.map(item => `${item.provider}: ${item.message}`).join("; ");
+  const unavailable = new Error(`Market data unavailable from Alpha Vantage, Google Finance, and Stooq. ${detail}`);
+  unavailable.diagnostics = diagnostics;
+  throw unavailable;
+}
+
 async function safeRequest(endpoint, params, ttlMs) {
-  try { return await finnhub(endpoint, params, ttlMs); }
+  try { return await alphaVantage({ function: endpoint, ...params }, ttlMs); }
   catch (error) { return { unavailable: true, message: error.message }; }
+}
+
+async function alphaVantageOverview(symbol, ttlMs = 86400000) {
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const overview = await alphaVantage({ function: "OVERVIEW", symbol: sourceSymbol }, ttlMs);
+  if (!overview || !overview.Symbol) throw new Error("Alpha Vantage returned no company overview");
+  const shares = Number(overview.SharesOutstanding);
+  const marketCapDollars = Number(overview.MarketCapitalization);
+  const revenue = Number(overview.RevenueTTM);
+  const profile = {
+    name: overview.Name || `${symbol} Holdings`,
+    exchange: overview.Exchange || (symbol.startsWith("^") ? "INDEX" : "NASDAQ"),
+    finnhubIndustry: overview.Sector || overview.Industry || (symbol.startsWith("^") ? "Market Index" : "N/A"),
+    marketCapitalization: Number.isFinite(marketCapDollars) ? marketCapDollars / 1_000_000 : null,
+    shareOutstanding: Number.isFinite(shares) ? shares / 1_000_000 : null
+  };
+  const metrics = { metric: {
+    epsTTM: Number(overview.EPS),
+    epsGrowth5Y: Number(overview.QuarterlyEarningsGrowthYOY) * 100,
+    peTTM: Number(overview.PERatio),
+    revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : Number(overview.RevenuePerShareTTM),
+    "52WeekHigh": Number(overview["52WeekHigh"]),
+    "52WeekLow": Number(overview["52WeekLow"])
+  } };
+  return { profile, metrics };
+}
+
+async function alphaVantageEarnings(symbol, ttlMs = 3600000) {
+  const data = await alphaVantage({ function: "EARNINGS", symbol: alphaVantageSymbol(symbol) }, ttlMs);
+  const rows = Array.isArray(data.quarterlyEarnings) ? data.quarterlyEarnings : [];
+  if (!rows.length) throw new Error("Alpha Vantage returned no earnings records");
+  return rows.slice(0, 12).map(row => {
+    const date = new Date(`${row.fiscalDateEnding}T00:00:00Z`);
+    const quarter = Math.floor(date.getUTCMonth() / 3) + 1;
+    const actual = Number(row.reportedEPS);
+    const estimate = Number(row.estimatedEPS);
+    return {
+      symbol,
+      year: date.getUTCFullYear(),
+      quarter,
+      period: `${date.getUTCFullYear()} Q${quarter}`,
+      actual,
+      estimate,
+      surprise: Number.isFinite(actual) && Number.isFinite(estimate) ? actual - estimate : Number(row.surprise)
+    };
+  });
+}
+
+function alphaNewsTimestamp(value) {
+  const match = String(value || "").match(/^(\d{4})(\d{2})(\d{2})T?(\d{2})(\d{2})(\d{2})/);
+  if (!match) return Math.floor(Date.now() / 1000);
+  const [, year, month, day, hour, minute, second] = match;
+  return Math.floor(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)) / 1000);
+}
+
+async function alphaVantageNews(symbol, ttlMs = 300000) {
+  const data = await alphaVantage({ function: "NEWS_SENTIMENT", tickers: alphaVantageSymbol(symbol), limit: 20 }, ttlMs);
+  const rows = Array.isArray(data.feed) ? data.feed : [];
+  if (!rows.length) throw new Error("Alpha Vantage returned no news records");
+  return rows.slice(0, 20).map((story, index) => ({
+    id: story.url || `${symbol}-alpha-${index}`,
+    datetime: alphaNewsTimestamp(story.time_published),
+    headline: story.title || "Untitled",
+    source: story.source || "Alpha Vantage",
+    url: story.url || "#",
+    summary: story.summary || ""
+  }));
 }
 
 async function cnnFearGreed(ttlMs = 300000) {
@@ -499,7 +815,7 @@ async function sectorEtfPerformance() {
     ["XLB", "Materials"], ["XLRE", "Real Estate"]
   ];
   const rows = await Promise.all(sectors.map(async ([symbol, name]) => {
-    const chart = await yahooChart(symbol, "1Y", 300000);
+    const chart = (await marketChart(symbol, "1Y", 300000)).candles;
     const points = chart.t.map((time, index) => ({ time: Number(time), close: Number(chart.c[index]) }))
       .filter(point => Number.isFinite(point.time) && Number.isFinite(point.close) && point.close > 0);
     const latest = points.at(-1);
@@ -517,119 +833,89 @@ async function sectorEtfPerformance() {
       ytd: changeFrom(yearStart)
     };
   }));
-  return { provider: "Yahoo Finance", fetchedAt: new Date().toISOString(), sectors: rows };
+  return { provider: "Alpha Vantage / Google Finance / Stooq", fetchedAt: new Date().toISOString(), sectors: rows };
 }
 
-async function handleFinnhubStock(req, res, requestUrl) {
-  if (!process.env.FINNHUB_API_KEY) return json(res, 503, { configured: false, error: "FINNHUB_API_KEY is not configured" });
+async function handleMarketStock(req, res, requestUrl) {
   const symbol = validSymbol(requestUrl.searchParams.get("symbol"));
   if (!symbol) return json(res, 400, { error: "Invalid ticker symbol" });
   const allowedRanges = new Set(["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "10Y"]);
   const range = allowedRanges.has(requestUrl.searchParams.get("range")) ? requestUrl.searchParams.get("range") : "6M";
-  const window = candleWindow(range);
-  const resolution = window.resolution;
   const today = new Date();
   const newsTo = today.toISOString().slice(0, 10);
   today.setDate(today.getDate() - 30);
   const newsFrom = today.toISOString().slice(0, 10);
 
-  const [quote, profile, metrics, finnhubCandles, earnings, news, sentiment, recommendations, probabilityCandles] = await Promise.all([
-    safeRequest("quote", { symbol }, 30000),
-    safeRequest("stock/profile2", { symbol }, 86400000),
-    safeRequest("stock/metric", { symbol, metric: "all" }, 3600000),
-    safeRequest("stock/candle", { symbol, resolution, from: window.from, to: window.to }, 300000),
-    safeRequest("stock/earnings", { symbol, limit: 12 }, 3600000),
-    safeRequest("company-news", { symbol, from: newsFrom, to: newsTo }, 300000),
-    safeRequest("news-sentiment", { symbol }, 300000),
-    safeRequest("stock/recommendation", { symbol }, 3600000),
-    yahooChart(symbol, "5Y", 300000).catch(error => ({ unavailable: true, provider: "Yahoo Finance", message: error.message }))
+  const [overview, earnings, news] = await Promise.all([
+    alphaVantageOverview(symbol, 86400000).catch(error => ({ unavailable: true, message: error.message })),
+    alphaVantageEarnings(symbol, 3600000).catch(error => ({ unavailable: true, message: error.message })),
+    alphaVantageNews(symbol, 300000).catch(error => ({ unavailable: true, message: error.message }))
   ]);
+  let candles, probabilityCandles, effectiveQuote;
   const dataDiagnostics = [];
-  let effectiveQuote = quote;
-  let candles;
-  if (!finnhubCandles?.unavailable && finnhubCandles?.s === "ok") {
-    candles = { ...finnhubCandles, displayFrom: window.displayFrom, range, resolution, provider: "Finnhub", authApplied: Boolean(process.env.FINNHUB_API_KEY), fetchedAt: new Date().toISOString() };
-    dataDiagnostics.push({ provider: "Finnhub candles", ok: true, authApplied: Boolean(process.env.FINNHUB_API_KEY), message: "Historical candles returned" });
-  } else {
-    dataDiagnostics.push({ provider: "Finnhub candles", ok: false, authApplied: Boolean(process.env.FINNHUB_API_KEY), message: finnhubCandles?.message || finnhubCandles?.s || "No candle history returned" });
+  try {
+    const market = await marketChart(symbol, range, 60000);
+    candles = market.candles;
+    effectiveQuote = market.quote;
+    dataDiagnostics.push(...market.diagnostics);
     try {
-      candles = await yahooChart(symbol, range);
-      dataDiagnostics.push({ provider: "Yahoo Finance fallback", ok: true, authApplied: false, message: "Historical candles returned after Finnhub was unavailable" });
+      probabilityCandles = (await marketChart(symbol, "5Y", 300000)).candles;
     } catch (error) {
-      candles = { unavailable: true, provider: "Finnhub + Yahoo Finance", message: `Historical data unavailable: ${error.message}` };
-      dataDiagnostics.push({ provider: "Yahoo Finance fallback", ok: false, authApplied: false, message: error.message });
+      dataDiagnostics.push({ provider: market.provider, ok: false, authApplied: Boolean(alphaVantageKey() || process.env.STOOQ_API_KEY), message: `5Y probability history unavailable: ${error.message}` });
+      probabilityCandles = candles;
     }
-  }
-  if (!candles || candles.unavailable || candles.s !== "ok") {
+  } catch (error) {
+    dataDiagnostics.push(...(error.diagnostics || []));
     candles = demoCandles(symbol, range);
-    dataDiagnostics.push({ provider: "Demo fallback", ok: true, authApplied: false, message: "Offline chart data returned because live providers were unavailable" });
+    probabilityCandles = demoCandles(symbol, "5Y");
+    effectiveQuote = demoQuote(symbol, candles);
+    dataDiagnostics.push({ provider: "Demo fallback", ok: true, authApplied: false, message: "Offline fallback returned because Alpha Vantage, Google Finance, and Stooq were unreachable from this environment" });
   }
-  const finnhubQuoteOk = !quote?.unavailable && Number(quote?.c) > 0;
-  if (!finnhubQuoteOk) {
-    try {
-      const yahooForQuote = candles?.provider === "Yahoo Finance fallback" ? candles : await yahooChart(symbol, range, 30000);
-      effectiveQuote = yahooQuote(yahooForQuote);
-    } catch (error) {
-      dataDiagnostics.push({ provider: "Yahoo Finance quote fallback", ok: false, authApplied: false, message: error.message });
-    }
-  }
-  if (!Number(effectiveQuote?.c)) effectiveQuote = demoQuote(symbol, candles);
-  const effectiveQuoteOk = Number(effectiveQuote?.c) > 0;
-  dataDiagnostics.unshift({
-    provider: finnhubQuoteOk ? "Finnhub quote" : "Yahoo Finance quote fallback",
-    ok: effectiveQuoteOk,
-    authApplied: finnhubQuoteOk && Boolean(process.env.FINNHUB_API_KEY),
-    message: finnhubQuoteOk ? "Current live quote returned" : effectiveQuote?.provider === "Demo fallback (offline)" ? "Offline quote returned because live providers were unavailable" : effectiveQuoteOk ? "Quote returned after Finnhub was unavailable" : quote?.message || "Quote unavailable"
-  });
 
   json(res, 200, {
     configured: true,
-    provider: candles?.provider === "Yahoo Finance fallback" || effectiveQuote?.provider === "Yahoo Finance fallback" ? "Finnhub + Yahoo Finance fallback" : "Finnhub",
+    provider: candles?.provider || "Market data",
     fetchedAt: new Date().toISOString(),
     symbol,
     range,
-    resolution,
-    quoteProvider: effectiveQuote?.provider || "Finnhub",
+    resolution: candles.resolution,
+    quoteProvider: effectiveQuote?.provider || "Market data",
     candleProvider: candles?.provider || null,
     dataDiagnostics,
     quote: effectiveQuote,
-    profile: usablePayload(profile) ? profile : demoProfile(symbol),
-    metrics: usablePayload(metrics) ? metrics : demoMetrics(symbol),
+    profile: usablePayload(overview?.profile) ? overview.profile : demoProfile(symbol),
+    metrics: usablePayload(overview?.metrics) ? overview.metrics : demoMetrics(symbol),
     candles,
-    probabilityCandles: usablePayload(probabilityCandles) && probabilityCandles.s === "ok" ? probabilityCandles : demoCandles(symbol, "5Y"),
+    probabilityCandles,
     earnings: Array.isArray(earnings) ? earnings : demoEarnings(symbol),
     news: Array.isArray(news) ? news.slice(0, 20) : demoNews(symbol),
-    sentiment: usablePayload(sentiment) ? sentiment : { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 },
-    recommendations: Array.isArray(recommendations) ? recommendations : [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }]
+    sentiment: { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 },
+    recommendations: [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }]
   });
 }
 
-async function handleFinnhubCandles(req, res, requestUrl) {
+async function handleMarketCandles(req, res, requestUrl) {
   const symbol = validSymbol(requestUrl.searchParams.get("symbol"));
   const allowedRanges = new Set(["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "10Y"]);
   const range = allowedRanges.has(requestUrl.searchParams.get("range")) ? requestUrl.searchParams.get("range") : "6M";
   if (!symbol) return json(res, 400, { error: "Invalid ticker symbol" });
-  const window = candleWindow(range);
   try {
-    if (process.env.FINNHUB_API_KEY) {
-      const candles = await finnhub("stock/candle", { symbol, resolution: window.resolution, from: window.from, to: window.to }, 60000);
-      if (candles?.s === "ok" && Array.isArray(candles.t) && candles.t.length >= 2) {
-        return json(res, 200, { ...candles, symbol, range, displayFrom: window.displayFrom, resolution: window.resolution, provider: "Finnhub", fetchedAt: new Date().toISOString() });
-      }
-    }
-  } catch {
-    // Continue to Yahoo Finance when Finnhub is unavailable or not entitled.
-  }
-  try {
-    return json(res, 200, await yahooChart(symbol, range, 60000));
+    return json(res, 200, (await marketChart(symbol, range, 60000)).candles);
   } catch (error) {
-    return json(res, 200, { ...demoCandles(symbol, range), detail: `Live historical candle requests failed: ${error.message}` });
+    return json(res, 200, {
+      ...demoCandles(symbol, range),
+      detail: `Live historical candle requests failed: ${error.message}`,
+      dataDiagnostics: [
+        ...(error.diagnostics || []),
+        { provider: "Demo fallback", ok: true, authApplied: false, message: "Offline fallback returned because live providers were unreachable from this environment" }
+      ]
+    });
   }
 }
 
-function streamFinnhubQuotes(req, res, requestUrl) {
+function streamMarketQuotes(req, res, requestUrl) {
   const symbol = validSymbol(requestUrl.searchParams.get("symbol"));
-  if (!symbol || !process.env.FINNHUB_API_KEY) return json(res, 400, { error: "A valid symbol and FINNHUB_API_KEY are required" });
+  if (!symbol || !alphaVantageKey()) return json(res, 400, { error: "A valid symbol and ALPHA_VANTAGE_API_KEY are required" });
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -640,7 +926,7 @@ function streamFinnhubQuotes(req, res, requestUrl) {
   const send = async () => {
     if (closed) return;
     try {
-      const quote = await finnhub("quote", { symbol }, 4000);
+      const quote = await alphaVantageQuote(symbol, 60000);
       res.write(`event: quote\ndata: ${JSON.stringify({ symbol, quote, fetchedAt: new Date().toISOString() })}\n\n`);
     } catch (error) {
       res.write(`event: error\ndata: ${JSON.stringify({ message: error.message })}\n\n`);
@@ -831,6 +1117,8 @@ function serveStatic(req, res) {
   });
 }
 
+const port = Number(process.env.PORT) || 4890;
+
 http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url, "http://127.0.0.1");
   if (requestUrl.pathname === "/api/cnn/fear-greed") {
@@ -845,7 +1133,7 @@ http.createServer(async (req, res) => {
     try { return json(res, 200, await sectorEtfPerformance()); }
     catch (error) { return json(res, 200, { ...demoSectorEtfPerformance(), detail: `Sector ETF data unavailable: ${error.message}` }); }
   }
-  if (requestUrl.pathname === "/api/finnhub/status") return json(res, 200, { configured: Boolean(process.env.FINNHUB_API_KEY), provider: "Finnhub" });
+  if (requestUrl.pathname === "/api/market/status" || requestUrl.pathname === "/api/finnhub/status") return json(res, 200, { configured: Boolean(alphaVantageKey()), provider: "Alpha Vantage" });
   if (requestUrl.pathname === "/api/market-data/status") return json(res, 200, { configured: Boolean(process.env.MARKET_DATA_API_TOKEN), provider: "Market Data" });
   if (requestUrl.pathname === "/api/options/gamma") {
     const symbol = validSymbol(requestUrl.searchParams.get("symbol"));
@@ -903,16 +1191,16 @@ http.createServer(async (req, res) => {
       return json(res, 400, { error: error.message });
     }
   }
-  if (requestUrl.pathname === "/api/finnhub/stock") {
-    try { return await handleFinnhubStock(req, res, requestUrl); }
+  if (requestUrl.pathname === "/api/market/stock" || requestUrl.pathname === "/api/finnhub/stock") {
+    try { return await handleMarketStock(req, res, requestUrl); }
     catch (error) { return json(res, 502, { error: "Market data request failed", detail: error.message }); }
   }
-  if (requestUrl.pathname === "/api/finnhub/candles") return handleFinnhubCandles(req, res, requestUrl);
-  if (requestUrl.pathname === "/api/finnhub/stream") return streamFinnhubQuotes(req, res, requestUrl);
+  if (requestUrl.pathname === "/api/market/candles" || requestUrl.pathname === "/api/finnhub/candles") return handleMarketCandles(req, res, requestUrl);
+  if (requestUrl.pathname === "/api/market/stream" || requestUrl.pathname === "/api/finnhub/stream") return streamMarketQuotes(req, res, requestUrl);
   serveStatic(req, res);
-}).listen(4890, "127.0.0.1", () => {
-  console.log("MarketLens AI running at http://127.0.0.1:4890");
-  console.log(`Finnhub API: ${process.env.FINNHUB_API_KEY ? "configured" : "not configured"}`);
+}).listen(port, "127.0.0.1", () => {
+  console.log(`MarketLens AI running at http://127.0.0.1:${port}`);
+  console.log(`Alpha Vantage API: ${alphaVantageKey() ? "configured" : "not configured"}`);
   console.log(`Market Data API: ${process.env.MARKET_DATA_API_TOKEN ? "configured" : "demo access only"}`);
   console.log(`Gemini API: ${process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY ? "configured" : "not configured"}`);
 });

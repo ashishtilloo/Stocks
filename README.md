@@ -1,12 +1,12 @@
 # MarketLens AI
 
-## Finnhub setup
+## Alpha Vantage setup
 
 1. Copy `.env.example` to `.env`.
-2. Replace the placeholder with your Finnhub API key:
+2. Replace the placeholder with your Alpha Vantage API key:
 
    ```text
-   FINNHUB_API_KEY=your_real_key
+   ALPHA_VANTAGE_API_KEY=your_real_key
    MARKET_DATA_API_TOKEN=your_optional_options_data_token
    ```
 
@@ -22,15 +22,14 @@ The keys are read only by `server.js`. They are never returned to the browser, s
 
 ## Live data behavior
 
-- Quotes refresh through Finnhub's quote endpoint and backend SSE stream.
-- Company identity and market capitalization use the company profile endpoint.
-- P/E, EPS, growth, and 52-week values use basic financial metrics.
-- Price Action requests Finnhub OHLC candles and volume first, then uses Yahoo Finance chart history when Finnhub is unavailable. If every live provider is unreachable, the UI can show clearly labeled `Demo fallback (offline)` data so charts do not render blank during development or demos.
-- News uses Finnhub company news. Broad market sentiment uses CNN's Fear & Greed index, components, and historical series.
-- The S&P moving-average panel requests index history from Finnhub.
+- Quotes, OHLC candles, volume, company overview, fundamentals, EPS history, and company news use Alpha Vantage first.
+- Google Finance quote and Stooq daily OHLC are fallback sources when Alpha Vantage is unavailable.
+- Index symbols such as `^GSPC` use liquid ETF proxies where Alpha Vantage does not provide direct index candles.
+- Broad market sentiment uses CNN's Fear & Greed index, components, and historical series.
+- The S&P moving-average panel requests market history through the same backend market-data provider chain.
 - Server-side caching reduces rate-limit pressure.
 
-Before public launch, review Finnhub's and Yahoo Finance's rate limits, terms, and redistribution requirements, then deploy the backend over HTTPS with keys stored in the host's secret manager.
+Before public launch, review Alpha Vantage, Google Finance, and Stooq rate limits, terms, and redistribution requirements, then deploy the backend over HTTPS with keys stored in the host's secret manager.
 
 ## Production build
 
@@ -53,11 +52,11 @@ Use Cloudflare Pages for this frontend build:
 
 Do not set the deploy command to `npx wrangler deploy` for this Pages project. Wrangler's auto-configuration can generate a Cloudflare Vite plugin config that breaks this CommonJS app during the second build step. The `public/_redirects` file is copied to `dist/_redirects` so Cloudflare can serve the single-page app correctly.
 
-This repo's `server.js` is a local Node API server. Cloudflare Pages static hosting will serve the app UI, but backend API routes such as `/api/finnhub/stock`, `/api/macro/indicators`, and `/api/options/gamma` need a hosted backend or Cloudflare Pages Functions/Workers before production users can receive live server-side data.
+This repo's `server.js` is a local Node API server. Cloudflare Pages static hosting will serve the app UI, but backend API routes such as `/api/market/stock`, `/api/macro/indicators`, and `/api/options/gamma` need a hosted backend or Cloudflare Pages Functions/Workers before production users can receive live server-side data. Older `/api/finnhub/...` paths remain as compatibility aliases.
 
 This repo includes a Cloudflare Pages Function at `functions/api/[[path]].js` so deployed `/api/...` requests can respond on Pages. Add production secrets in Cloudflare Pages **Settings -> Environment variables**:
 
-- `FINNHUB_API_KEY`
+- `ALPHA_VANTAGE_API_KEY`
 - `MARKET_DATA_API_TOKEN` if you use the external options data provider
 - `GEMINI_API_KEY` and optional `GEMINI_MODEL`
 - `FIREBASE_API_KEY`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_PROJECT_ID`, `FIREBASE_STORAGE_BUCKET`, `FIREBASE_MESSAGING_SENDER_ID`, `FIREBASE_APP_ID`
