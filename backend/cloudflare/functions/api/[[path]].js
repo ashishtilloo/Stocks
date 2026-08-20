@@ -380,6 +380,7 @@ async function marketChart(env, symbol, range) {
   const detail = diagnostics.map(item => `${item.provider}: ${item.message}`).join("; ");
   const unavailable = new Error(`Market data unavailable from Market Data, Alpha Vantage, Google Finance, and Stooq. ${detail}`);
   unavailable.diagnostics = diagnostics;
+  unavailable.partialQuote = marketDataQuote || googleQuote;
   throw unavailable;
 }
 
@@ -774,9 +775,15 @@ async function stockPayload(env, url) {
     diagnostics.push(...market.diagnostics);
   } catch (error) {
     diagnostics.push(...(error.diagnostics || []));
-    candles = demoCandles(symbol, range);
-    quote = demoQuote(symbol, candles);
-    diagnostics.push({ provider: "Demo fallback", ok: true, authApplied: false, message: "Offline fallback returned because Alpha Vantage, Google Finance, and Stooq were unreachable from this environment" });
+    if (error.partialQuote && Number.isFinite(Number(error.partialQuote.c)) && Number(error.partialQuote.c) > 0) {
+      quote = error.partialQuote;
+      candles = { unavailable: true, s: "no_data", symbol, range, provider: "Live quote only", message: "Historical candles are unavailable, but the live quote provider returned a current price." };
+      diagnostics.push({ provider: quote.provider || "Live quote", ok: true, authApplied: false, message: "Live quote preserved while chart history was unavailable" });
+    } else {
+      candles = demoCandles(symbol, range);
+      quote = demoQuote(symbol, candles);
+      diagnostics.push({ provider: "Demo fallback", ok: true, authApplied: false, message: "Offline fallback returned because Alpha Vantage, Google Finance, and Stooq were unreachable from this environment" });
+    }
   }
   try {
     const overview = await alphaVantageOverview(env, symbol);
