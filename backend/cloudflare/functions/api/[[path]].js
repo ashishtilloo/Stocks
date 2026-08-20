@@ -1,6 +1,13 @@
+const corsHeaders = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,OPTIONS",
+  "access-control-allow-headers": "content-type,authorization"
+};
+
 const json = (body, status = 200) => new Response(JSON.stringify(body), {
   status,
   headers: {
+    ...corsHeaders,
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store"
   }
@@ -741,10 +748,11 @@ async function stockPayload(env, url) {
 export async function onRequest(context) {
   const url = new URL(context.request.url);
   const pathname = url.pathname;
-  if (pathname === "/api/market/stock" || pathname === "/api/finnhub/stock") return stockPayload(context.env, url);
+  if (context.request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
+  if (pathname === "/api/market/stock" || pathname === "/api/market/quote" || pathname === "/api/finnhub/stock") return stockPayload(context.env, url);
   if (pathname === "/api/market/status" || pathname === "/api/finnhub/status") return json({ configured: Boolean(alphaVantageKey(context.env)), provider: "Alpha Vantage" });
   if (pathname === "/api/market-data/status") return json({ configured: Boolean(context.env.MARKET_DATA_API_TOKEN), provider: "Market Data" });
-  if (pathname === "/api/market/candles" || pathname === "/api/finnhub/candles") {
+  if (pathname === "/api/market/candles" || pathname === "/api/market/history" || pathname === "/api/finnhub/candles") {
     const symbol = validSymbol(url.searchParams.get("symbol"));
     if (!symbol) return json({ error: "Invalid ticker symbol" }, 400);
     const range = new Set(["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "10Y"]).has(url.searchParams.get("range")) ? url.searchParams.get("range") : "6M";
@@ -766,7 +774,7 @@ export async function onRequest(context) {
     let quote = null;
     try { if (symbol) quote = (await marketChart(context.env, symbol, "1D")).quote; } catch {}
     return new Response(`event: quote\ndata: ${JSON.stringify({ symbol, ...quote })}\n\n`, {
-      headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" }
+      headers: { ...corsHeaders, "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" }
     });
   }
   if (pathname === "/api/macro/indicators") {
@@ -777,7 +785,7 @@ export async function onRequest(context) {
     }
   }
   if (pathname === "/api/macro/sector-etfs") return json(demoSectors());
-  if (pathname === "/api/cnn/fear-greed") return json(demoFearGreed());
+  if (pathname === "/api/cnn/fear-greed" || pathname === "/api/market/sentiment") return json(demoFearGreed());
   if (pathname === "/api/options/gamma") {
     const symbol = validSymbol(url.searchParams.get("symbol"));
     if (!symbol || symbol.startsWith("^") || symbol.includes("-")) return json({ error: "Enter a valid stock or ETF ticker with listed options" }, 400);
