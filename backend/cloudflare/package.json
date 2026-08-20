@@ -3,6 +3,6 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "build": "node -e \"require('fs').mkdirSync('public',{recursive:true});require('fs').writeFileSync('public/index.html','MarketLens API\\n')\""
+    "build": "echo build"
   }
 }
