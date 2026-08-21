@@ -378,7 +378,11 @@ function priceIndicators(symbol) {
   const closes = Array.isArray(payload?.c) ? payload.c.map(Number).filter(Number.isFinite) : [];
   const highs = Array.isArray(payload?.h) ? payload.h.map(Number) : [];
   const lows = Array.isArray(payload?.l) ? payload.l.map(Number) : [];
-  const sma = size => closes.length >= size ? closes.slice(-size).reduce((sum, value) => sum + value, 0) / size : null;
+  const maPayload = usablePayload(marketData.probabilityCandles[symbol]) && marketData.probabilityCandles[symbol].s === "ok"
+    ? marketData.probabilityCandles[symbol]
+    : payload;
+  const maCloses = Array.isArray(maPayload?.c) ? maPayload.c.map(Number).filter(Number.isFinite) : closes;
+  const sma = size => maCloses.length >= size ? maCloses.slice(-size).reduce((sum, value) => sum + value, 0) / size : null;
   const rsi = calculateRsi(closes, 14);
   const tsi = calculateTsi(closes, 25, 13);
   const momentum20 = closes.length > 20 ? (closes.at(-1) / closes.at(-21) - 1) * 100 : null;
@@ -1842,6 +1846,45 @@ function movingAverageData(candles, period) {
   return result;
 }
 
+function candleRowsFromPayload(payload) {
+  if (!payload || !Array.isArray(payload.t)) return [];
+  return payload.t.map((time, index) => ({
+    time: Number(time),
+    open: Number(payload.o?.[index]),
+    high: Number(payload.h?.[index]),
+    low: Number(payload.l?.[index]),
+    close: Number(payload.c?.[index]),
+    volume: Number(payload.v?.[index]) || 0
+  })).filter(row => [row.time, row.open, row.high, row.low, row.close].every(Number.isFinite)).sort((a, b) => a.time - b.time);
+}
+
+function movingAverageLookupFromPayload(payload, period) {
+  const rows = candleRowsFromPayload(payload);
+  const lookup = [], sample = [];
+  let sum = 0;
+  rows.forEach(row => {
+    sample.push(row.close);
+    sum += row.close;
+    if (sample.length > period) sum -= sample.shift();
+    if (sample.length === period) lookup.push({ time: row.time, value: sum / period });
+  });
+  return lookup;
+}
+
+function alignMovingAverageToCandles(candles, lookup) {
+  const values = Array(candles.length).fill(null);
+  if (!candles.length || !lookup.length) return values;
+  let pointer = 0, last = null;
+  candles.forEach((candle, index) => {
+    while (pointer < lookup.length && lookup[pointer].time <= candle.time) {
+      last = lookup[pointer].value;
+      pointer += 1;
+    }
+    values[index] = Number.isFinite(last) ? last : null;
+  });
+  return values;
+}
+
 function drawPriceChart() {
   const canvas = document.getElementById("price-chart");
   const payload = marketData.candles[ticker];
@@ -1853,27 +1896,20 @@ function drawPriceChart() {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const w = canvas.width / dpr, h = canvas.height / dpr;
-  const fullCandles = payload.t.map((time, index) => ({
-    time: Number(time), open: Number(payload.o?.[index]), high: Number(payload.h?.[index]),
-    low: Number(payload.l?.[index]), close: Number(payload.c?.[index]), volume: Number(payload.v?.[index]) || 0
-  })).filter(row => [row.time,row.open,row.high,row.low,row.close].every(Number.isFinite)).sort((a, b) => a.time - b.time);
-  const fullCloses = fullCandles.map(row => row.close);
-  const averageValues = period => {
-    const values = Array(fullCandles.length).fill(null), sample = [];
-    let sum = 0;
-    fullCloses.forEach((value, index) => {
-      sample.push(value); sum += value;
-      if (sample.length > period) sum -= sample.shift();
-      if (sample.length === period) values[index] = sum / period;
-    });
-    return values;
-  };
-  const fullAverages = { ma10: averageValues(10), ma20: averageValues(20), ma50: averageValues(50), ma150: averageValues(150) };
+  const fullCandles = candleRowsFromPayload(payload);
   const displayFrom = Number(payload.displayFrom);
   const visibleStart = Number.isFinite(displayFrom) ? Math.max(0, fullCandles.findIndex(row => row.time >= displayFrom)) : 0;
   const candles = fullCandles.slice(visibleStart);
-  const averages = Object.fromEntries(Object.entries(fullAverages).map(([key, values]) => [key, values.slice(visibleStart)]));
   if (candles.length < 2) return;
+  const averageSource = usablePayload(marketData.probabilityCandles[ticker]) && marketData.probabilityCandles[ticker].s === "ok"
+    ? marketData.probabilityCandles[ticker]
+    : payload;
+  const averages = {
+    ma10: alignMovingAverageToCandles(candles, movingAverageLookupFromPayload(averageSource, 10)),
+    ma20: alignMovingAverageToCandles(candles, movingAverageLookupFromPayload(averageSource, 20)),
+    ma50: alignMovingAverageToCandles(candles, movingAverageLookupFromPayload(averageSource, 50)),
+    ma150: alignMovingAverageToCandles(candles, movingAverageLookupFromPayload(averageSource, 150))
+  };
   const isLight = document.documentElement.dataset.theme === "light";
   const colors = {
     text: isLight ? "#59687b" : "#a7adba", grid: isLight ? "rgba(82,97,116,.14)" : "rgba(148,163,184,.095)",
