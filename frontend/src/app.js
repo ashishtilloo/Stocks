@@ -1891,8 +1891,8 @@ function drawPriceChart() {
   const pad = { left: 20, right: 70, top: 16, bottom: 36 };
   const volumeHeight = chartIndicators.volume ? 82 : 0;
   const priceBottom = h - pad.bottom - volumeHeight - (volumeHeight ? 6 : 0);
+  // Keep zoom based on the visible price action; warmup MAs should not stretch the chart scale.
   const scaleValues = candles.flatMap(row => [row.low, row.high]);
-  Object.entries(averages).forEach(([key, values]) => { if (chartIndicators[key]) scaleValues.push(...values.filter(Number.isFinite)); });
   const rawMin = Math.min(...scaleValues), rawMax = Math.max(...scaleValues), spread = Math.max(rawMax - rawMin, Math.abs(rawMax) * .015, 1);
   const min = rawMin - spread * .08, max = rawMax + spread * .08;
   const plotWidth = w - pad.left - pad.right;
