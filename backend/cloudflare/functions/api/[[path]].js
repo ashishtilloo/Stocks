@@ -697,6 +697,21 @@ function demoFearGreed() {
   return { provider: "Demo fallback (offline)", fetchedAt: new Date().toISOString(), fear_and_greed: { score: 54, rating: "Neutral", previous_close: 52, previous_1_week: 49, previous_1_month: 57, previous_1_year: 45 }, fear_and_greed_historical: { data: history }, market_momentum_sp500: { score: 58, rating: "Neutral" }, stock_price_strength: { score: 55, rating: "Neutral" }, stock_price_breadth: { score: 51, rating: "Neutral" }, put_call_options: { score: 47, rating: "Neutral" }, market_volatility_vix: { score: 62, rating: "Greed" }, junk_bond_demand: { score: 53, rating: "Neutral" }, safe_haven_demand: { score: 49, rating: "Neutral" } };
 }
 
+async function cnnFearGreed() {
+  const response = await fetch("https://production.dataviz.cnn.io/index/fearandgreed/graphdata", {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      Accept: "application/json, text/plain, */*",
+      Origin: "https://www.cnn.com",
+      Referer: "https://www.cnn.com/"
+    }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`CNN request failed (${response.status})`);
+  if (!Number.isFinite(Number(data?.fear_and_greed?.score))) throw new Error("CNN returned an invalid Fear & Greed response");
+  return { ...data, provider: "CNN Fear & Greed", fetchedAt: new Date().toISOString() };
+}
+
 function normalPdf(value) {
   return Math.exp(-0.5 * value * value) / Math.sqrt(2 * Math.PI);
 }
@@ -910,7 +925,13 @@ export async function onRequest(context) {
     }
   }
   if (pathname === "/api/macro/sector-etfs") return json(demoSectors());
-  if (pathname === "/api/cnn/fear-greed" || pathname === "/api/market/sentiment") return json(demoFearGreed());
+  if (pathname === "/api/cnn/fear-greed" || pathname === "/api/market/sentiment") {
+    try {
+      return json(await cnnFearGreed());
+    } catch (error) {
+      return json({ ...demoFearGreed(), detail: `CNN Fear & Greed unavailable: ${error.message}` });
+    }
+  }
   if (pathname === "/api/options/gamma") {
     const symbol = validSymbol(url.searchParams.get("symbol"));
     if (!symbol || symbol.startsWith("^") || symbol.includes("-")) return json({ error: "Enter a valid stock or ETF ticker with listed options" }, 400);
