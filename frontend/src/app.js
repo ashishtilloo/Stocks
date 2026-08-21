@@ -445,7 +445,10 @@ async function refreshTickerData(symbol, rerender = true) {
     if (!response.ok) throw new Error(payload.error || "Market data request failed");
     marketData.configured = true;
     const providerLabel = payload.quoteProvider || payload.quote?.provider || payload.provider || "";
-    const hasLiveQuote = usablePayload(payload.quote) && Number(payload.quote.c) > 0;
+    const hasLiveQuote = usablePayload(payload.quote)
+      && Number(payload.quote.c) > 0
+      && !isDemoProvider(providerLabel)
+      && !isDemoProvider(payload.quote?.provider);
     const quote = hasLiveQuote ? payload.quote : {};
     const profile = usablePayload(payload.profile) ? payload.profile : {};
     const metrics = usablePayload(payload.metrics) ? (payload.metrics.metric || {}) : {};

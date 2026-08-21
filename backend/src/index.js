@@ -523,6 +523,71 @@ function chartQuote(chart) {
   };
 }
 
+function yahooChartConfig(range) {
+  return ({
+    "1D": { range: "1d", interval: "5m", resolution: "5" },
+    "5D": { range: "5d", interval: "15m", resolution: "15" },
+    "1M": { range: "1mo", interval: "60m", resolution: "60" },
+    "6M": { range: "6mo", interval: "1d", resolution: "D" },
+    YTD: { range: "ytd", interval: "1d", resolution: "D" },
+    "1Y": { range: "1y", interval: "1d", resolution: "D" },
+    "5Y": { range: "5y", interval: "1wk", resolution: "W" },
+    "10Y": { range: "10y", interval: "1wk", resolution: "W" }
+  })[range] || { range: "6mo", interval: "1d", resolution: "D" };
+}
+
+function yahooNumber(value) {
+  const number = Number(value);
+  return value === null || value === "" || !Number.isFinite(number) ? null : number;
+}
+
+async function yahooFinanceChart(symbol, range, ttlMs = 60000) {
+  const config = yahooChartConfig(range);
+  const cacheKey = `yahoo-chart:${symbol}:${range}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+  const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+  url.searchParams.set("range", config.range);
+  url.searchParams.set("interval", config.interval);
+  url.searchParams.set("includePrePost", "false");
+  url.searchParams.set("events", "div,splits");
+  const response = await fetch(url, {
+    headers: { accept: "application/json", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36" }
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.chart?.error?.description || `Yahoo Finance request failed (${response.status})`);
+  const result = payload?.chart?.result?.[0];
+  const timestamps = Array.isArray(result?.timestamp) ? result.timestamp : [];
+  const quote = result?.indicators?.quote?.[0] || {};
+  const rows = timestamps.map((time, index) => ({
+    time: yahooNumber(time),
+    open: yahooNumber(quote.open?.[index]),
+    high: yahooNumber(quote.high?.[index]),
+    low: yahooNumber(quote.low?.[index]),
+    close: yahooNumber(quote.close?.[index]),
+    volume: yahooNumber(quote.volume?.[index]) || 0
+  })).filter(row => [row.time, row.open, row.high, row.low, row.close].every(Number.isFinite));
+  if (rows.length < 2) throw new Error(payload?.chart?.error?.description || "Yahoo Finance returned insufficient chart history");
+  const data = {
+    s: "ok",
+    t: rows.map(row => row.time),
+    o: rows.map(row => row.open),
+    h: rows.map(row => row.high),
+    l: rows.map(row => row.low),
+    c: rows.map(row => row.close),
+    v: rows.map(row => row.volume),
+    meta: result?.meta || {},
+    symbol,
+    range,
+    displayFrom: rangeDisplayFrom(range, rows.at(-1).time),
+    resolution: config.resolution,
+    provider: "Yahoo Finance",
+    fetchedAt: new Date().toISOString()
+  };
+  setCached(cacheKey, data, ttlMs);
+  return data;
+}
+
 function googleFinanceCandidates(symbol) {
   const map = {
     "^GSPC": [".INX:INDEXSP"],
@@ -534,13 +599,14 @@ function googleFinanceCandidates(symbol) {
     DIA: ["DIA:NYSEARCA"]
   };
   if (map[symbol]) return map[symbol];
-  const nasdaq = new Set(["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "GOOG", "AMD", "NFLX", "INTC", "COST", "ADBE", "AVGO", "PEP", "CSCO", "CMCSA", "TMUS"]);
+  const nasdaq = new Set(["AAPL", "MSFT", "NVDA", "TSLA", "MU", "AMZN", "META", "GOOGL", "GOOG", "AMD", "NFLX", "INTC", "COST", "ADBE", "AVGO", "PEP", "CSCO", "CMCSA", "TMUS"]);
   const exchanges = nasdaq.has(symbol) ? ["NASDAQ", "NYSE", "NYSEARCA"] : ["NYSE", "NASDAQ", "NYSEARCA"];
   return exchanges.map(exchange => `${symbol}:${exchange}`);
 }
 
 function parseGoogleNumber(value) {
   const cleaned = String(value || "").replace(/&amp;/g, "&").replace(/[^\d.+-]/g, "");
+  if (!cleaned) return null;
   const number = Number(cleaned);
   return Number.isFinite(number) ? number : null;
 }
@@ -564,7 +630,7 @@ async function googleFinanceQuote(symbol, ttlMs = 60000) {
       if (!response.ok) throw new Error(`Google Finance request failed (${response.status})`);
       const current = parseGoogleNumber(html.match(/data-last-price="([^"]+)"/)?.[1])
         ?? parseGoogleNumber(html.match(/class="YMlKec fxKbKc">([^<]+)</)?.[1]);
-      if (!Number.isFinite(current)) throw new Error("Google Finance returned no current price");
+      if (!Number.isFinite(current) || current <= 0) throw new Error("Google Finance returned no current price");
       const previous = parseGoogleNumber(html.match(/data-previous-close="([^"]+)"/)?.[1]);
       const timestamp = Number(html.match(/data-last-normal-market-timestamp-sec="([^"]+)"/)?.[1]);
       const data = {
@@ -685,6 +751,17 @@ async function marketChart(symbol, range, ttlMs = 60000) {
     diagnostics.push({ provider: "Alpha Vantage", ok: false, authApplied: Boolean(alphaVantageKey()), message: error.message });
   }
 
+  try {
+    const candles = await yahooFinanceChart(symbol, range, ttlMs);
+    const yahooQuote = chartQuote(candles);
+    const quote = marketDataQuote || yahooQuote;
+    if (!Number.isFinite(Number(quote?.c)) || Number(quote.c) <= 0) throw new Error("Yahoo Finance returned candles but no current quote");
+    diagnostics.push({ provider: "Yahoo Finance", ok: true, authApplied: false, message: marketDataQuote ? "OHLC and volume returned; Market Data supplied quote" : "Current quote, OHLC, and volume returned" });
+    return { candles, quote, diagnostics, provider: marketDataQuote ? "Market Data + Yahoo Finance" : "Yahoo Finance" };
+  } catch (error) {
+    diagnostics.push({ provider: "Yahoo Finance", ok: false, authApplied: false, message: error.message });
+  }
+
   let googleQuote = null;
   try {
     googleQuote = await googleFinanceQuote(symbol, ttlMs);
@@ -704,7 +781,7 @@ async function marketChart(symbol, range, ttlMs = 60000) {
   }
 
   const detail = diagnostics.map(item => `${item.provider}: ${item.message}`).join("; ");
-  const unavailable = new Error(`Market data unavailable from Market Data, Alpha Vantage, Google Finance, and Stooq. ${detail}`);
+  const unavailable = new Error(`Market data unavailable from Market Data, Alpha Vantage, Yahoo Finance, Google Finance, and Stooq. ${detail}`);
   unavailable.diagnostics = diagnostics;
   unavailable.partialQuote = marketDataQuote || googleQuote;
   throw unavailable;
@@ -924,10 +1001,10 @@ async function handleMarketStock(req, res, requestUrl) {
       probabilityCandles = candles;
       dataDiagnostics.push({ provider: effectiveQuote.provider || "Live quote", ok: true, authApplied: false, message: "Live quote preserved while chart history was unavailable" });
     } else {
-      candles = demoCandles(symbol, range);
-      probabilityCandles = demoCandles(symbol, "5Y");
-      effectiveQuote = demoQuote(symbol, candles);
-      dataDiagnostics.push({ provider: "Demo fallback", ok: true, authApplied: false, message: "Offline fallback returned because Alpha Vantage, Google Finance, and Stooq were unreachable from this environment" });
+      candles = { unavailable: true, s: "no_data", symbol, range, provider: "Unavailable", message: "No verified historical candles were returned by the configured providers." };
+      probabilityCandles = candles;
+      effectiveQuote = { unavailable: true, c: null, d: null, dp: null, h: null, l: null, o: null, pc: null, t: null, provider: "Unavailable", message: "No verified live quote was returned by the configured providers." };
+      dataDiagnostics.push({ provider: "Market data", ok: false, authApplied: false, message: "No generated quote or chart data was substituted for the unavailable provider response" });
     }
   }
 
