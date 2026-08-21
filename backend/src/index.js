@@ -802,13 +802,15 @@ async function alphaVantageOverview(symbol, ttlMs = 86400000) {
   const profile = {
     name: overview.Name || `${symbol} Holdings`,
     exchange: overview.Exchange || (symbol.startsWith("^") ? "INDEX" : "NASDAQ"),
-    finnhubIndustry: overview.Sector || overview.Industry || (symbol.startsWith("^") ? "Market Index" : "N/A"),
+    sector: overview.Sector || (symbol.startsWith("^") ? "Market Index" : null),
+    industry: overview.Industry || null,
+    finnhubIndustry: overview.Industry || overview.Sector || (symbol.startsWith("^") ? "Market Index" : null),
     marketCapitalization: Number.isFinite(marketCapDollars) ? marketCapDollars / 1_000_000 : null,
     shareOutstanding: Number.isFinite(shares) ? shares / 1_000_000 : null
   };
   const metrics = { metric: {
     epsTTM: Number(overview.EPS),
-    epsGrowth5Y: Number(overview.QuarterlyEarningsGrowthYOY) * 100,
+    epsGrowthYoY: Number(overview.QuarterlyEarningsGrowthYOY) * 100,
     peTTM: Number(overview.PERatio),
     revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : Number(overview.RevenuePerShareTTM),
     "52WeekHigh": Number(overview["52WeekHigh"]),
@@ -975,12 +977,13 @@ async function handleMarketStock(req, res, requestUrl) {
   today.setDate(today.getDate() - 30);
   const newsFrom = today.toISOString().slice(0, 10);
 
-  const [overview, earnings, news] = await Promise.all([
+  let [overview, earnings, news] = await Promise.all([
     alphaVantageOverview(symbol, 86400000).catch(error => ({ unavailable: true, message: error.message })),
     alphaVantageEarnings(symbol, 3600000).catch(error => ({ unavailable: true, message: error.message })),
     alphaVantageNews(symbol, 300000).catch(error => ({ unavailable: true, message: error.message }))
   ]);
   let candles, probabilityCandles, effectiveQuote;
+  let fundamentalsProvider = usablePayload(overview?.profile) ? "Alpha Vantage" : "Unavailable";
   const dataDiagnostics = [];
   try {
     const market = await marketChart(symbol, range, 60000);
@@ -1008,6 +1011,28 @@ async function handleMarketStock(req, res, requestUrl) {
     }
   }
 
+  if (!usablePayload(overview?.profile) || !usablePayload(overview?.metrics)) {
+    dataDiagnostics.push({ provider: "Alpha Vantage fundamentals", ok: false, authApplied: Boolean(alphaVantageKey()), message: overview?.message || "Company overview unavailable" });
+    try {
+      overview = await yahooFundamentals(symbol, 3600000);
+      fundamentalsProvider = "Yahoo Finance";
+      dataDiagnostics.push({ provider: "Yahoo Finance fundamentals", ok: true, authApplied: false, message: "Verified company profile and valuation fields returned" });
+    } catch (error) {
+      dataDiagnostics.push({ provider: "Yahoo Finance fundamentals", ok: false, authApplied: false, message: error.message });
+    }
+  }
+
+  const chartMeta = candles?.meta || {};
+  const basicProfile = {
+    name: chartMeta.longName || chartMeta.shortName || symbol,
+    exchange: chartMeta.fullExchangeName || chartMeta.exchangeName || chartMeta.exchange || null,
+    sector: null,
+    industry: null,
+    finnhubIndustry: null,
+    marketCapitalization: null,
+    shareOutstanding: null
+  };
+
   json(res, 200, {
     configured: true,
     provider: candles?.provider || "Market data",
@@ -1017,10 +1042,11 @@ async function handleMarketStock(req, res, requestUrl) {
     resolution: candles.resolution,
     quoteProvider: effectiveQuote?.provider || "Market data",
     candleProvider: candles?.provider || null,
+    fundamentalsProvider,
     dataDiagnostics,
     quote: effectiveQuote,
-    profile: usablePayload(overview?.profile) ? overview.profile : demoProfile(symbol),
-    metrics: usablePayload(overview?.metrics) ? overview.metrics : demoMetrics(symbol),
+    profile: usablePayload(overview?.profile) ? overview.profile : basicProfile,
+    metrics: usablePayload(overview?.metrics) ? overview.metrics : { metric: {} },
     candles,
     probabilityCandles,
     earnings: Array.isArray(earnings) ? earnings : demoEarnings(symbol),
@@ -1185,6 +1211,64 @@ async function yahooSession(force = false) {
   const crumb = (await crumbResponse.text()).trim();
   if (!crumbResponse.ok || !crumb || /unauthorized|error/i.test(crumb)) throw new Error("Yahoo Finance did not issue a valid crumb");
   const data = { cookie, crumb };
+  cache.set(cacheKey, { time: Date.now(), data });
+  return data;
+}
+
+const yahooRawNumber = value => {
+  const raw = value?.raw ?? value;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const number = Number(raw);
+  return Number.isFinite(number) ? number : null;
+};
+
+async function yahooFundamentals(symbol, ttlMs = 3600000, retry = true) {
+  const cacheKey = `yahoo:fundamentals:${symbol}`;
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.time < ttlMs) return cached.data;
+  const session = await yahooSession();
+  const url = new URL(`https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}`);
+  url.searchParams.set("modules", "assetProfile,price,summaryDetail,defaultKeyStatistics,financialData");
+  url.searchParams.set("crumb", session.crumb);
+  const response = await fetch(url, {
+    headers: { Accept: "application/json", Cookie: session.cookie, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36" },
+    signal: AbortSignal.timeout(12000)
+  });
+  const payload = await response.json().catch(() => ({}));
+  const errorMessage = payload?.quoteSummary?.error?.description || payload?.finance?.error?.description || "";
+  if (retry && (response.status === 401 || /crumb|unauthorized/i.test(errorMessage))) {
+    await yahooSession(true);
+    return yahooFundamentals(symbol, ttlMs, false);
+  }
+  if (!response.ok) throw new Error(errorMessage || `Yahoo fundamentals request failed (${response.status})`);
+  const result = payload?.quoteSummary?.result?.[0];
+  if (!result) throw new Error("Yahoo Finance returned no company fundamentals");
+  const asset = result.assetProfile || {};
+  const price = result.price || {};
+  const summary = result.summaryDetail || {};
+  const statistics = result.defaultKeyStatistics || {};
+  const financial = result.financialData || {};
+  const shares = yahooRawNumber(statistics.sharesOutstanding);
+  const revenue = yahooRawNumber(financial.totalRevenue);
+  const data = {
+    profile: {
+      name: price.longName || price.shortName || symbol,
+      exchange: price.exchangeName || price.fullExchangeName || price.exchange || null,
+      sector: asset.sector || null,
+      industry: asset.industry || null,
+      finnhubIndustry: asset.industry || asset.sector || null,
+      marketCapitalization: Number.isFinite(yahooRawNumber(price.marketCap)) ? yahooRawNumber(price.marketCap) / 1_000_000 : null,
+      shareOutstanding: Number.isFinite(shares) ? shares / 1_000_000 : null
+    },
+    metrics: { metric: {
+      epsTTM: yahooRawNumber(statistics.trailingEps),
+      epsGrowthYoY: Number.isFinite(yahooRawNumber(financial.earningsGrowth)) ? yahooRawNumber(financial.earningsGrowth) * 100 : null,
+      peTTM: yahooRawNumber(summary.trailingPE),
+      revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : yahooRawNumber(financial.revenuePerShare),
+      "52WeekHigh": yahooRawNumber(summary.fiftyTwoWeekHigh),
+      "52WeekLow": yahooRawNumber(summary.fiftyTwoWeekLow)
+    } }
+  };
   cache.set(cacheKey, { time: Date.now(), data });
   return data;
 }

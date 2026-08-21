@@ -271,7 +271,7 @@ function ensureStock(value) {
     open: null, high: null, low: null, prev: null, sector: starter.sector || "", industry: starter.sector || "",
     eps: null, growth: null, graham: null
   };
-  companyMetrics[symbol] = { revenue: "N/A", pe: "N/A" };
+  companyMetrics[symbol] = { revenue: "N/A", pe: "N/A", provider: "Unavailable" };
   return symbol;
 }
 
@@ -469,6 +469,7 @@ async function refreshTickerData(symbol, rerender = true) {
     const quote = hasLiveQuote ? payload.quote : {};
     const profile = usablePayload(payload.profile) ? payload.profile : {};
     const metrics = usablePayload(payload.metrics) ? (payload.metrics.metric || {}) : {};
+    const metricNumber = value => value !== null && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
     const current = stocks[requested];
     const price = Number(quote.c) || current.price;
     const previous = Number(quote.pc) || current.prev || price;
@@ -482,10 +483,10 @@ async function refreshTickerData(symbol, rerender = true) {
       high: Number(quote.h) || current.high,
       low: Number(quote.l) || current.low,
       prev: previous,
-      sector: profile.finnhubIndustry || current.sector,
-      industry: profile.finnhubIndustry || current.industry,
-      eps: Number(metrics.epsTTM) || current.eps,
-      growth: Number(metrics.epsGrowth5Y) || Number(metrics.epsGrowth3Y) || current.growth,
+      sector: profile.sector || "N/A",
+      industry: profile.industry || profile.finnhubIndustry || "N/A",
+      eps: metricNumber(metrics.epsTTM),
+      growth: metricNumber(metrics.epsGrowthYoY),
       weekHigh: Number(metrics["52WeekHigh"]) || null,
       weekLow: Number(metrics["52WeekLow"]) || null,
       marketCap: Number(profile.marketCapitalization) || Number(metrics.marketCapitalization) || null,
@@ -494,12 +495,13 @@ async function refreshTickerData(symbol, rerender = true) {
       quoteTime: Number(quote.t) || null,
       quoteProvider: providerLabel || "Alpha Vantage"
     });
-    const pe = Number(metrics.peTTM) || Number(metrics.peNormalizedAnnual);
-    const revenuePerShare = Number(metrics.revenuePerShareTTM);
-    const shares = Number(profile.shareOutstanding);
+    const pe = metricNumber(metrics.peTTM) ?? metricNumber(metrics.peNormalizedAnnual);
+    const revenuePerShare = metricNumber(metrics.revenuePerShareTTM);
+    const shares = metricNumber(profile.shareOutstanding);
     companyMetrics[requested] = {
-      revenue: revenuePerShare && shares ? `$${(revenuePerShare * shares / 1000).toFixed(1)}B` : "N/A",
-      pe: pe ? `${pe.toFixed(1)}x` : "N/A"
+      revenue: Number.isFinite(revenuePerShare) && Number.isFinite(shares) && shares > 0 ? `$${(revenuePerShare * shares / 1000).toFixed(1)}B` : "N/A",
+      pe: Number.isFinite(pe) && pe > 0 ? `${pe.toFixed(1)}x` : "N/A",
+      provider: payload.fundamentalsProvider || "Unavailable"
     };
     if (usablePayload(payload.candles) && payload.candles.s === "ok" && Array.isArray(payload.candles.c)) {
       marketData.candles[requested] = { ...payload.candles, range: chartRange, resolution: payload.resolution };
@@ -971,13 +973,13 @@ function dashboard() {
 
     <section class="grid cols-2 section">
       <div class="card clickable" data-detail="fundamentals">
-        <h3>Fundamentals &amp; Trend</h3><p class="subtle">Company classification, fundamentals, and price-derived trend indicators</p>
+        <h3>Fundamentals &amp; Trend</h3><p class="subtle">${escapeHtml(company.provider)} fundamentals and price-derived trend indicators</p>
         <div class="grid cols-3 section">
-          <div><div class="metric">Sector · ${s.sector}</div><strong class="green">UPTREND · 50%</strong></div>
-          <div><div class="metric">Industry</div><strong>${s.industry}</strong></div>
-          <div><div class="metric">TSI (25,13)</div><strong>5.0</strong><p class="muted">Neutral</p></div>
-          <div><div class="metric">EPS (TTM)</div><strong>${s.eps ? fmt(s.eps) : "-"}</strong></div>
-          <div><div class="metric">EPS Growth 5Y</div><strong>${Number.isFinite(s.growth) ? `${s.growth.toFixed(1)}%` : "N/A"}</strong></div>
+          <div><div class="metric">Sector · ${escapeHtml(s.sector || "N/A")}</div><strong class="${trend.className}">${trend.label}${Number.isFinite(trend.score) ? ` · ${trend.score}%` : ""}</strong></div>
+          <div><div class="metric">Industry</div><strong>${escapeHtml(s.industry || "N/A")}</strong></div>
+          <div><div class="metric">TSI (25,13)</div><strong class="${Number.isFinite(technical.tsi) ? technical.tsi >= 10 ? "green" : technical.tsi <= -10 ? "red" : "amber" : ""}">${Number.isFinite(technical.tsi) ? technical.tsi.toFixed(1) : "N/A"}</strong><p class="muted">${tsiState}</p></div>
+          <div><div class="metric">EPS (TTM)</div><strong>${Number.isFinite(s.eps) ? fmt(s.eps) : "N/A"}</strong></div>
+          <div><div class="metric">EPS Growth (YoY)</div><strong>${Number.isFinite(s.growth) ? `${s.growth.toFixed(1)}%` : "N/A"}</strong></div>
           <div><div class="metric">Revenue (TTM)</div><strong>${company.revenue}</strong></div>
           <div><div class="metric">P/E (TTM)</div><strong>${company.pe}</strong></div>
         </div>
@@ -1547,7 +1549,7 @@ function openDetail(kind) {
     },
     "fundamentals": {
       title: "Fundamentals & trend",
-      body: `<p>${ticker} is classified under ${s.sector || "N/A"} / ${s.industry || "N/A"}. Fundamentals below are returned by Alpha Vantage.</p><div class="grid cols-3 section"><div class="stat"><div class="metric">Revenue TTM</div><strong>${company.revenue}</strong></div><div class="stat"><div class="metric">P/E TTM</div><strong>${company.pe}</strong></div><div class="stat"><div class="metric">EPS TTM</div><strong>${s.eps ? fmt(s.eps) : "N/A"}</strong></div><div class="stat"><div class="metric">5Y EPS Growth</div><strong>${Number.isFinite(s.growth) ? `${s.growth.toFixed(1)}%` : "N/A"}</strong></div><div class="stat"><div class="metric">Trend</div><strong class="${trend.className}">${trend.label}${Number.isFinite(trend.score) ? ` - ${trend.score}%` : ""}</strong></div><div class="stat"><div class="metric">TSI (25,13)</div><strong class="${Number.isFinite(technical.tsi) ? technical.tsi >= 10 ? "green" : technical.tsi <= -10 ? "red" : "amber" : ""}">${Number.isFinite(technical.tsi) ? technical.tsi.toFixed(1) : "N/A"}</strong><p class="muted">${tsiState}</p></div></div>`
+      body: `<p>${ticker} is classified under ${s.sector || "N/A"} / ${s.industry || "N/A"}. Fundamentals below are returned by ${company.provider || "a verified provider"}.</p><div class="grid cols-3 section"><div class="stat"><div class="metric">Revenue TTM</div><strong>${company.revenue}</strong></div><div class="stat"><div class="metric">P/E TTM</div><strong>${company.pe}</strong></div><div class="stat"><div class="metric">EPS TTM</div><strong>${Number.isFinite(s.eps) ? fmt(s.eps) : "N/A"}</strong></div><div class="stat"><div class="metric">EPS Growth (YoY)</div><strong>${Number.isFinite(s.growth) ? `${s.growth.toFixed(1)}%` : "N/A"}</strong></div><div class="stat"><div class="metric">Trend</div><strong class="${trend.className}">${trend.label}${Number.isFinite(trend.score) ? ` - ${trend.score}%` : ""}</strong></div><div class="stat"><div class="metric">TSI (25,13)</div><strong class="${Number.isFinite(technical.tsi) ? technical.tsi >= 10 ? "green" : technical.tsi <= -10 ? "red" : "amber" : ""}">${Number.isFinite(technical.tsi) ? technical.tsi.toFixed(1) : "N/A"}</strong><p class="muted">${tsiState}</p></div></div>`
     },
     "earnings": {
       title: "Earnings reports",
@@ -1691,7 +1693,7 @@ function compactAssistantContext() {
       annualizedVolatility: ctx.technical.volatility, atrFromSma50: ctx.atrDistance
     },
     probability: { chanceHigher: ctx.directional.probabilities[horizon], expectedSwing: ctx.directional.swings[horizon] },
-    fundamentals: { revenue: ctx.company.revenue, pe: ctx.company.pe, eps: ctx.stock.eps, epsGrowth5Y: ctx.stock.growth },
+    fundamentals: { revenue: ctx.company.revenue, pe: ctx.company.pe, eps: ctx.stock.eps, epsGrowthYoY: ctx.stock.growth, provider: ctx.company.provider },
     headlines: ctx.newsItems,
     dataSource: ctx.candle?.provider || "loading"
   };
@@ -1763,7 +1765,7 @@ function assistantReply(rawMessage, options = {}) {
   const probabilityLine = directional.available
     ? `Probability model: ${prob}% chance higher over ${horizon}, with about +/-${swing}% expected swing.`
     : "Probability model: unavailable until Alpha Vantage or Stooq candle history is returned for this ticker.";
-  const fundamentalLine = `Fundamentals: revenue ${company.revenue}, P/E ${company.pe}, EPS ${stock.eps ? fmt(stock.eps) : "N/A"}, 5Y EPS growth ${Number.isFinite(stock.growth) ? `${stock.growth.toFixed(1)}%` : "N/A"}.`;
+  const fundamentalLine = `Fundamentals (${company.provider || "verified provider"}): revenue ${company.revenue}, P/E ${company.pe}, EPS ${Number.isFinite(stock.eps) ? fmt(stock.eps) : "N/A"}, YoY EPS growth ${Number.isFinite(stock.growth) ? `${stock.growth.toFixed(1)}%` : "N/A"}.`;
   const newsLine = newsItems.length ? `Recent headlines I see: ${newsItems.join(" / ")}.` : "Recent news is not loaded yet for this ticker.";
   const offlineNote = options.fallbackReason ? `\n\nNote: live generative AI is unavailable right now (${options.fallbackReason}), so I am using the app's loaded ${ticker} quote, chart, fundamentals, probability, and news context.` : "";
   const bullish = [
