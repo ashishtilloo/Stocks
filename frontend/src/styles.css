@@ -270,14 +270,16 @@ button.active { background: rgba(54, 211, 153, 0.16); border-color: rgba(54, 211
 #price-chart[hidden] { display: none; }
 .chart-state { display: grid; min-height: 330px; place-items: center; padding: 24px; color: var(--muted); background: #0d1423; text-align: center; }
 .chart-state[hidden] { display: none; }
-.rsi-chart-wrap { position: relative; margin: 8px -8px 0; border-top: 1px solid rgba(255,255,255,.08); background: #0b111f; }
-.rsi-chart-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 62px 0 34px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--muted); font-size: 12px; }
-#rsi-chart { height: 122px; border: 0; border-radius: 0; background: transparent; }
+.oscillator-chart-wrap, .rsi-chart-wrap { position: relative; margin: 8px -8px 0; border-top: 1px solid rgba(255,255,255,.08); background: #0b111f; }
+.oscillator-chart-head, .rsi-chart-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 62px 0 34px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--muted); font-size: 12px; }
+#stochastic-chart, #rsi-chart { height: 122px; border: 0; border-radius: 0; background: transparent; }
 .price-tooltip { position: absolute; z-index: 2; min-width: 170px; padding: 10px; background: rgba(10,16,28,.94); border: 1px solid #273246; border-radius: 7px; box-shadow: 0 12px 30px rgba(0,0,0,.35); pointer-events: none; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .price-tooltip span, .price-tooltip b, .price-tooltip em { display: block; font-size: 11px; line-height: 1.7; font-style: normal; }
 .price-tooltip span { color: var(--muted); }
 .price-tooltip b, .price-tooltip em { color: #e0bc69; }
 .price-tooltip .blue { color: #3aa0d8; }
+.price-tooltip .green { color: #6ee7b7; }
+.price-tooltip .red { color: #fb7185; }
 .chart-crosshair-tooltip { position: fixed; z-index: 100; pointer-events: none; }
 .price-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; padding-top: 17px; margin-top: 6px; border-top: 1px solid rgba(255,255,255,.1); }
 .price-metrics > div { min-height: 52px; padding-right: 16px; }
@@ -753,7 +755,7 @@ footer {
   .chart-options { width: 100%; justify-content: space-between; }
   .indicator-controls { gap: 12px 18px; }
   #price-chart { height: 340px; }
-  #rsi-chart { height: 104px; }
+  #stochastic-chart, #rsi-chart { height: 104px; }
   .price-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 18px; }
   .gamma-head { align-items: flex-start; flex-direction: column; }
   .gamma-search { width: 100%; grid-template-columns: minmax(0,1fr) auto; }

@@ -99,7 +99,7 @@ let ticker = "AAPL";
 let horizon = "1M";
 let chartRange = "6M";
 let priceChartMode = "area";
-const chartIndicators = { ma10: true, ma20: true, ma50: true, volume: true };
+const chartIndicators = { ma10: true, ma20: true, ma50: true, ma150: true, volume: true };
 const customTargetPrices = { price: null, options: null };
 let optionSide = "Buy Call";
 let earningsShowEstimates = true;
@@ -356,6 +356,23 @@ function calculateTsi(closes, longPeriod = 25, shortPeriod = 13) {
   return Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0 ? numerator / denominator * 100 : null;
 }
 
+function calculateStochasticSeries(highs, lows, closes, period = 14, smooth = 3) {
+  const k = closes.map((close, index) => {
+    if (index < period - 1 || !Number.isFinite(close)) return null;
+    const highWindow = highs.slice(index - period + 1, index + 1).filter(Number.isFinite);
+    const lowWindow = lows.slice(index - period + 1, index + 1).filter(Number.isFinite);
+    if (highWindow.length !== period || lowWindow.length !== period) return null;
+    const highest = Math.max(...highWindow), lowest = Math.min(...lowWindow);
+    return highest === lowest ? 50 : (close - lowest) / (highest - lowest) * 100;
+  });
+  const d = k.map((_, index) => {
+    if (index < smooth - 1) return null;
+    const window = k.slice(index - smooth + 1, index + 1);
+    return window.every(Number.isFinite) ? window.reduce((sum, value) => sum + value, 0) / smooth : null;
+  });
+  return { k, d };
+}
+
 function priceIndicators(symbol) {
   const payload = marketData.candles[symbol];
   const closes = Array.isArray(payload?.c) ? payload.c.map(Number).filter(Number.isFinite) : [];
@@ -383,7 +400,7 @@ function priceIndicators(symbol) {
     ? Math.abs(lastClose - sma50) / atr14
     : null;
   return {
-    sma10: sma(10), sma20: sma(20), sma50, sma200: sma(200), rsi, tsi, momentum20, atr14, atrFromSma50,
+    sma10: sma(10), sma20: sma(20), sma50, sma150: sma(150), sma200: sma(200), rsi, tsi, momentum20, atr14, atrFromSma50,
     volatility: variance === null ? null : Math.sqrt(variance * periodsPerYear) * 100,
     drift: returns.length ? Math.max(-.5, Math.min(.5, mean * periodsPerYear)) : null
   };
@@ -909,14 +926,16 @@ function dashboard() {
           </div>
         </div>
         <div class="indicator-controls">
-          ${[["ma10","MA 10","#d8a93f"],["ma20","MA 20","#e0bc69"],["ma50","MA 50","#3aa0d8"],["volume","Volume","#7d8493"]].map(([key,label,color]) => `<label class="indicator-toggle"><input type="checkbox" data-indicator="${key}" ${chartIndicators[key] ? "checked" : ""}><span class="switch"></span><i style="--indicator:${color}"></i><b>${label}</b></label>`).join("")}
+          ${[["ma10","MA 10","#d8a93f"],["ma20","MA 20","#e0bc69"],["ma50","MA 50","#3aa0d8"],["ma150","MA 150","#6ee7b7"],["volume","Volume","#7d8493"]].map(([key,label,color]) => `<label class="indicator-toggle"><input type="checkbox" data-indicator="${key}" ${chartIndicators[key] ? "checked" : ""}><span class="switch"></span><i style="--indicator:${color}"></i><b>${label}</b></label>`).join("")}
         </div>
         <div class="price-canvas-wrap"><canvas id="price-chart" aria-label="${ticker} price and volume chart from ${escapeHtml(candleProvider)}" ${marketData.candles[ticker]?.s === "ok" ? "" : "hidden"}></canvas><div id="price-chart-state" class="chart-state" ${marketData.candles[ticker]?.s === "ok" ? "hidden" : ""}>${marketData.loading ? "Loading market history..." : escapeHtml(marketData.candles[ticker]?.message || "Historical candles are unavailable for this timeframe.")}</div></div>
+        <div class="oscillator-chart-wrap"><div class="oscillator-chart-head"><span>Stochastic 14,3</span><b id="stochastic-value">N/A</b></div><canvas id="stochastic-chart" aria-label="${ticker} stochastic oscillator line chart"></canvas></div>
         <div class="rsi-chart-wrap"><div class="rsi-chart-head"><span>RSI 14</span><b class="${Number.isFinite(technical.rsi) ? technical.rsi >= 70 ? "red" : technical.rsi <= 30 ? "green" : "amber" : ""}">${Number.isFinite(technical.rsi) ? technical.rsi.toFixed(1) : "N/A"}</b></div><canvas id="rsi-chart" aria-label="${ticker} RSI 14 line chart"></canvas></div>
         <div class="price-metrics">
           <div><div class="metric">SMA 10</div><strong>${metricPrice(technical.sma10)}</strong></div>
           <div><div class="metric">SMA 20</div><strong>${metricPrice(technical.sma20)}</strong></div>
           <div><div class="metric">SMA 50</div><strong>${metricPrice(technical.sma50)}</strong></div>
+          <div><div class="metric">SMA 150</div><strong>${metricPrice(technical.sma150)}</strong></div>
           <div><div class="metric">%ATR from 50 MA &lt; 4</div><strong class="${atrRulePasses ? "green" : "red"}">${Number.isFinite(atrDistance) ? atrDistance.toFixed(2) : "N/A"}</strong><p class="muted">${Number.isFinite(atrDistance) ? (atrRulePasses ? "Pass" : "Extended") : "Unavailable"}</p></div>
           <div><div class="metric">RSI 14</div><strong>${Number.isFinite(technical.rsi) ? technical.rsi.toFixed(1) : "N/A"}</strong><p class="muted">${rsiState}</p></div>
           <div><div class="metric">Ann. Volatility</div><strong>${metricPercent(technical.volatility)}</strong></div>
@@ -1799,6 +1818,7 @@ function assistantReply(rawMessage, options = {}) {
 
 function drawCharts() {
   drawPriceChart();
+  drawStochasticChart();
   drawRsiChart();
   drawEarningsChart();
   drawGammaExposureChart();
@@ -1848,7 +1868,7 @@ function drawPriceChart() {
     });
     return values;
   };
-  const fullAverages = { ma10: averageValues(10), ma20: averageValues(20), ma50: averageValues(50) };
+  const fullAverages = { ma10: averageValues(10), ma20: averageValues(20), ma50: averageValues(50), ma150: averageValues(150) };
   const displayFrom = Number(payload.displayFrom);
   const visibleStart = Number.isFinite(displayFrom) ? Math.max(0, fullCandles.findIndex(row => row.time >= displayFrom)) : 0;
   const candles = fullCandles.slice(visibleStart);
@@ -1857,7 +1877,7 @@ function drawPriceChart() {
   const isLight = document.documentElement.dataset.theme === "light";
   const colors = {
     text: isLight ? "#59687b" : "#a7adba", grid: isLight ? "rgba(82,97,116,.14)" : "rgba(148,163,184,.095)",
-    gold: "#d8a93f", goldSoft: "#e0bc69", blue: "#3aa0d8", up: "#36d399", down: "#fb7185"
+    gold: "#d8a93f", goldSoft: "#e0bc69", blue: "#3aa0d8", green: "#6ee7b7", up: "#36d399", down: "#fb7185"
   };
   const pad = { left: 20, right: 70, top: 16, bottom: 36 };
   const volumeHeight = chartIndicators.volume ? 82 : 0;
@@ -1918,6 +1938,7 @@ function drawPriceChart() {
   if (chartIndicators.ma10) drawAverage(averages.ma10, colors.gold, 1, [3, 4]);
   if (chartIndicators.ma20) drawAverage(averages.ma20, colors.goldSoft, 1.3, [5, 4]);
   if (chartIndicators.ma50) drawAverage(averages.ma50, colors.blue, 1.7);
+  if (chartIndicators.ma150) drawAverage(averages.ma150, colors.green, 1.55);
   const labelCount = Math.min(["1D","5D"].includes(chartRange) ? 6 : chartRange === "1M" ? 7 : 8, candles.length);
   const labelIndexes = Array.from({ length: labelCount }, (_, index) => Math.round(index * (candles.length - 1) / Math.max(1, labelCount - 1)));
   labelIndexes.forEach((candleIndex, index) => {
@@ -1931,8 +1952,8 @@ function drawPriceChart() {
   });
   enableChartCrosshair(canvas, drawPriceChart, pad, ratio => {
     const index = Math.max(0, Math.min(candles.length - 1, Math.round(ratio * (candles.length - 1)))), row = candles[index];
-    const ma = (key, label) => Number.isFinite(averages[key][index]) ? `<em class="${key === "ma50" ? "blue" : ""}">${label} ${fmt(averages[key][index])}</em>` : "";
-    return `<span>${new Date(row.time * 1000).toLocaleString()}</span><b>Close ${fmt(row.close)}</b><em>O ${fmt(row.open)} · H ${fmt(row.high)} · L ${fmt(row.low)}</em>${ma("ma10","MA 10")}${ma("ma20","MA 20")}${ma("ma50","MA 50")}<em>Volume ${compactNumber(row.volume)}</em>`;
+    const ma = (key, label) => Number.isFinite(averages[key]?.[index]) ? `<em class="${key === "ma50" ? "blue" : key === "ma150" ? "green" : ""}">${label} ${fmt(averages[key][index])}</em>` : "";
+    return `<span>${new Date(row.time * 1000).toLocaleString()}</span><b>Close ${fmt(row.close)}</b><em>O ${fmt(row.open)} · H ${fmt(row.high)} · L ${fmt(row.low)}</em>${ma("ma10","MA 10")}${ma("ma20","MA 20")}${ma("ma50","MA 50")}${ma("ma150","MA 150")}<em>Volume ${compactNumber(row.volume)}</em>`;
   });
   if (!canvas._priceResizeBound) {
     priceChartResizeObserver?.disconnect();
@@ -2296,6 +2317,97 @@ function drawSentimentHistory() {
     const score = values[index];
     const rating = score >= 75 ? "Extreme greed" : score >= 55 ? "Greed" : score >= 45 ? "Neutral" : score >= 25 ? "Fear" : "Extreme fear";
     return `<span>${new Date(visible[index].time).toLocaleDateString()}</span><b>Fear &amp; Greed ${score.toFixed(1)}</b><em>${rating}</em>`;
+  });
+}
+
+function drawStochasticChart() {
+  const c = document.getElementById("stochastic-chart");
+  if (!c) return;
+  const rect = c.getBoundingClientRect();
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  c.width = Math.max(760, Math.round(rect.width * dpr));
+  c.height = Math.round(rect.height * dpr);
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = c.width / dpr, h = c.height / dpr;
+  const pad = { top: 12, right: 62, bottom: 22, left: 34 };
+  const payload = marketData.candles[ticker];
+  const hasCandles = payload && payload.range === chartRange && payload.s === "ok" && payload.c?.length > 18;
+  const valueLabel = document.getElementById("stochastic-value");
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "11px ui-monospace, SFMono-Regular, Consolas, monospace";
+  if (!hasCandles) {
+    if (valueLabel) valueLabel.textContent = "N/A";
+    ctx.fillStyle = "#9aa8bd"; ctx.textAlign = "center";
+    ctx.fillText(marketData.loading ? "Loading stochastic..." : "Stochastic history unavailable.", w / 2, h / 2);
+    return;
+  }
+  const candles = payload.t.map((time, index) => ({
+    time: Number(time), high: Number(payload.h?.[index]), low: Number(payload.l?.[index]), close: Number(payload.c?.[index])
+  })).filter(row => [row.time, row.high, row.low, row.close].every(Number.isFinite)).sort((a, b) => a.time - b.time);
+  let timestamps = candles.map(row => row.time);
+  const { k, d } = calculateStochasticSeries(candles.map(row => row.high), candles.map(row => row.low), candles.map(row => row.close), 14, 3);
+  let kValues = k, dValues = d;
+  const displayFrom = Number(payload.displayFrom);
+  if (Number.isFinite(displayFrom)) {
+    const visibleStart = Math.max(0, timestamps.findIndex(time => Number(time) >= displayFrom));
+    timestamps = timestamps.slice(visibleStart);
+    kValues = kValues.slice(visibleStart);
+    dValues = dValues.slice(visibleStart);
+  }
+  const maxRenderedPoints = ["1Y","5Y","10Y"].includes(chartRange) ? 240 : 600;
+  if (kValues.length > maxRenderedPoints) {
+    const bucketSize = Math.ceil(kValues.length / maxRenderedPoints);
+    const compactK = [], compactD = [], compactTimestamps = [];
+    for (let i = 0; i < kValues.length; i += bucketSize) {
+      const end = Math.min(kValues.length, i + bucketSize);
+      let selected = -1;
+      for (let j = end - 1; j >= i; j--) {
+        if (Number.isFinite(kValues[j]) || Number.isFinite(dValues[j])) { selected = j; break; }
+      }
+      compactK.push(selected >= 0 ? kValues[selected] : null);
+      compactD.push(selected >= 0 ? dValues[selected] : null);
+      compactTimestamps.push(selected >= 0 ? timestamps[selected] : null);
+    }
+    kValues = compactK; dValues = compactD; timestamps = compactTimestamps;
+  }
+  const kPoints = kValues.map((value, index) => ({ value, index })).filter(point => Number.isFinite(point.value));
+  const dPoints = dValues.map((value, index) => ({ value, index })).filter(point => Number.isFinite(point.value));
+  const latestK = [...kValues].reverse().find(Number.isFinite);
+  const latestD = [...dValues].reverse().find(Number.isFinite);
+  if (valueLabel) {
+    valueLabel.textContent = Number.isFinite(latestK) ? `%K ${latestK.toFixed(1)}${Number.isFinite(latestD) ? ` · %D ${latestD.toFixed(1)}` : ""}` : "N/A";
+    valueLabel.className = Number.isFinite(latestK) ? latestK >= 80 ? "red" : latestK <= 20 ? "green" : "amber" : "";
+  }
+  if (kPoints.length < 2) {
+    ctx.fillStyle = "#9aa8bd"; ctx.textAlign = "center";
+    ctx.fillText("Not enough history for stochastic.", w / 2, h / 2);
+    return;
+  }
+  const x = index => pad.left + index * (w - pad.left - pad.right) / Math.max(1, kValues.length - 1);
+  const y = value => pad.top + (100 - value) / 100 * (h - pad.top - pad.bottom);
+  [80, 50, 20].forEach(level => {
+    const yy = y(level);
+    ctx.strokeStyle = level === 50 ? "rgba(226,232,240,.18)" : "rgba(110,231,183,.22)";
+    ctx.setLineDash(level === 50 ? [2, 5] : [5, 5]);
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(w - pad.right, yy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = "#8f98aa"; ctx.textAlign = "left"; ctx.fillText(String(level), w - pad.right + 10, yy + 4);
+  });
+  const drawLine = (points, color, width, dash = []) => {
+    if (points.length < 2) return;
+    ctx.beginPath();
+    points.forEach((point, index) => index ? ctx.lineTo(x(point.index), y(point.value)) : ctx.moveTo(x(point.index), y(point.value)));
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash); ctx.stroke(); ctx.setLineDash([]);
+  };
+  drawLine(kPoints, "#6ee7b7", 1.8);
+  drawLine(dPoints, "#e0bc69", 1.35, [5, 4]);
+  enableChartCrosshair(c, drawStochasticChart, pad, ratio => {
+    const index = Math.max(0, Math.min(kValues.length - 1, Math.round(ratio * (kValues.length - 1))));
+    const kValue = kValues[index], dValue = dValues[index];
+    if (!Number.isFinite(kValue) && !Number.isFinite(dValue)) return "";
+    const dateLabel = timestamps?.[index] ? new Date(Number(timestamps[index]) * 1000).toLocaleDateString() : `${chartRange} session ${index + 1}`;
+    const state = Number(kValue) >= 80 ? "Overbought" : Number(kValue) <= 20 ? "Oversold" : "Neutral";
+    return `<span>${dateLabel}</span><b>Stoch %K ${Number.isFinite(kValue) ? kValue.toFixed(1) : "N/A"}</b><em>%D ${Number.isFinite(dValue) ? dValue.toFixed(1) : "N/A"}</em><em class="${state === "Oversold" ? "green" : state === "Overbought" ? "red" : ""}">${state}</em>`;
   });
 }
 
