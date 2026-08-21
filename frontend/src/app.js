@@ -102,6 +102,7 @@ let priceChartMode = "area";
 const chartIndicators = { ma10: true, ma20: true, ma50: true, ma150: true, volume: true };
 const customTargetPrices = { price: null, options: null };
 let optionSide = "Buy Call";
+let optionPremium = null;
 let earningsShowEstimates = true;
 const gammaExposure = { symbol: "AAPL", dte: 30, loading: false, data: null, error: "", requestId: 0 };
 const macroRanges = { unemployment: "2Y", inflation: "2Y", fed: "2Y", treasury: "2Y" };
@@ -992,7 +993,7 @@ function dashboard() {
 
     <section class="grid cols-2 section">
       ${probabilityPanel("Price target probability", "Chance of reaching a target price across timeframes", priceTarget, "Probability of reaching", "price", false, "target-probability")}
-      ${probabilityPanel("Options probability", "Historical outcomes blended with current listed-option implied volatility", optionsTarget, "Terminal-price probability", "options", true, "options-probability")}
+      ${probabilityPanel("Options probability", "Strategy-aware expiration probability using listed-option IV and your premium", optionsTarget, "Terminal-price probability", "options", true, "options-probability")}
     </section>
   `);
   arrangeDashboardLayout();
@@ -1026,11 +1027,10 @@ function normalCdf(value) {
   return .5 * (1 + sign * erf);
 }
 
-function barrierTouchProbability(spot, target, drift, volatility, years) {
-  if (![spot, target, drift, volatility, years].every(Number.isFinite) || spot <= 0 || target <= 0 || volatility <= 0 || years <= 0) return null;
+function barrierTouchProbability(spot, target, logDrift, volatility, years) {
+  if (![spot, target, logDrift, volatility, years].every(Number.isFinite) || spot <= 0 || target <= 0 || volatility <= 0 || years <= 0) return null;
   if (Math.abs(target - spot) < .000001) return 100;
   const sigmaRootT = volatility * Math.sqrt(years);
-  const logDrift = drift - volatility * volatility / 2;
   const upper = target > spot;
   const distance = Math.abs(Math.log(target / spot));
   const directionalDrift = upper ? logDrift : -logDrift;
@@ -1039,39 +1039,42 @@ function barrierTouchProbability(spot, target, drift, volatility, years) {
   return Math.max(0, Math.min(100, probability * 100));
 }
 
-function historicalOutcomeProbability(payload, spot, target, horizonDays, touchTarget, directionAbove) {
-  if (!payload?.c?.length || !Number.isFinite(spot) || !Number.isFinite(target) || spot <= 0 || target <= 0) return null;
-  const closes = payload.c.map(Number).filter(value => Number.isFinite(value) && value > 0);
-  if (closes.length < horizonDays + 40) return null;
-  const requiredRatio = target / spot;
-  let weightedHits = 0, totalWeight = 0, samples = 0;
-  const halfLife = 504;
-  for (let start = 0; start + horizonDays < closes.length; start++) {
-    const base = closes[start];
-    const weight = Math.pow(.5, (closes.length - horizonDays - start) / halfLife);
-    let hit;
-    if (touchTarget) {
-      const future = closes.slice(start + 1, start + horizonDays + 1);
-      hit = directionAbove
-        ? Math.max(...future) / base >= requiredRatio
-        : Math.min(...future) / base <= requiredRatio;
-    } else {
-      const terminalRatio = closes[start + horizonDays] / base;
-      hit = directionAbove ? terminalRatio >= requiredRatio : terminalRatio <= requiredRatio;
+function marketReturnModel(payload) {
+  if (!payload?.c?.length || /demo fallback|offline/i.test(String(payload.provider || ""))) return null;
+  const timestamps = Array.isArray(payload.t) ? payload.t : [];
+  const points = payload.c.map((close, index) => ({
+    close: Number(close),
+    time: Number(timestamps[index]) > 1e12 ? Number(timestamps[index]) / 1000 : Number(timestamps[index])
+  })).filter(point => Number.isFinite(point.close) && point.close > 0 && Number.isFinite(point.time));
+  points.sort((a, b) => a.time - b.time);
+  if (points.length < 30) return null;
+
+  const returns = [];
+  const intervals = [];
+  for (let index = 1; index < points.length; index++) {
+    const days = (points[index].time - points[index - 1].time) / 86400;
+    const value = Math.log(points[index].close / points[index - 1].close);
+    if (Number.isFinite(value) && days > 0 && days < 45) {
+      returns.push(value);
+      intervals.push(days);
     }
-    weightedHits += hit ? weight : 0;
-    totalWeight += weight;
-    samples += 1;
   }
-  if (!samples || !totalWeight) return null;
-  return { probability: (weightedHits + 0.5) / (totalWeight + 1) * 100, samples };
+  if (returns.length < 25) return null;
+  const orderedIntervals = [...intervals].sort((a, b) => a - b);
+  const medianDays = orderedIntervals[Math.floor(orderedIntervals.length / 2)];
+  const periodsPerYear = medianDays <= 3 ? 252 : Math.min(252, 365.25 / medianDays);
+  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, returns.length - 1);
+  const volatility = Math.max(.03, Math.min(2.5, Math.sqrt(variance * periodsPerYear)));
+  // Historical drift is noisy, so use a conservative quarter-weighted estimate.
+  const logDrift = Math.max(-.2, Math.min(.2, mean * periodsPerYear * .25));
+  return { volatility, logDrift, observations: returns.length, medianDays };
 }
 
-function optionImpliedTerminalProbability(spot, strike, volatility, years, directionAbove) {
-  if (![spot,strike,volatility,years].every(Number.isFinite) || spot <= 0 || strike <= 0 || volatility <= 0 || years <= 0) return null;
-  const rate = 0.043;
-  const z = (Math.log(spot / strike) + (rate - volatility * volatility / 2) * years) / (volatility * Math.sqrt(years));
-  const above = normalCdf(z) * 100;
+function terminalThresholdProbability(spot, threshold, volatility, years, logDrift, directionAbove) {
+  if (![spot, threshold, volatility, years, logDrift].every(Number.isFinite) || spot <= 0 || threshold <= 0 || volatility <= 0 || years <= 0) return null;
+  const z = (Math.log(threshold / spot) - logDrift * years) / (volatility * Math.sqrt(years));
+  const above = (1 - normalCdf(z)) * 100;
   return directionAbove ? above : 100 - above;
 }
 
@@ -1082,24 +1085,44 @@ function probabilityPanel(title, subtitle, target, label, targetKind, options = 
   const horizons = [["1D",1],["1W",5],["1M",21],["6M",126],["1Y",252]];
   const history = marketData.probabilityCandles[ticker];
   const historyProvider = history?.provider || "market history";
-  const impliedVolatility = gammaExposure.data?.symbol === ticker ? Number(gammaExposure.data.atmImpliedVolatility) : null;
-  const estimates = history ? horizons.map(([,days]) => {
-    const historical = historicalOutcomeProbability(history, spot, target, days, !options, directionAbove);
-    if (!historical) return null;
-    if (!options || !Number.isFinite(impliedVolatility)) return historical;
-    const implied = optionImpliedTerminalProbability(spot, target, impliedVolatility, days / 252, directionAbove);
-    return { ...historical, probability: Number.isFinite(implied) ? historical.probability * .35 + implied * .65 : historical.probability, implied };
+  const returnModel = marketReturnModel(history);
+  const rawImpliedVolatility = gammaExposure.data?.symbol === ticker && !/demo fallback|offline/i.test(String(gammaExposure.data?.provider || ""))
+    ? Number(gammaExposure.data.atmImpliedVolatility)
+    : null;
+  const impliedVolatility = Number.isFinite(rawImpliedVolatility)
+    ? rawImpliedVolatility > 3 ? rawImpliedVolatility / 100 : rawImpliedVolatility
+    : null;
+  const premiumEntered = options && Number.isFinite(optionPremium) && optionPremium >= 0;
+  const premium = premiumEntered ? optionPremium : 0;
+  const breakEven = options
+    ? optionSide.includes("Call") ? target + premium : Math.max(.01, target - premium)
+    : target;
+  const modelVolatility = options && Number.isFinite(impliedVolatility) && impliedVolatility > 0
+    ? impliedVolatility
+    : returnModel?.volatility;
+  const estimates = returnModel && Number.isFinite(modelVolatility) ? horizons.map(([, days]) => {
+    const years = days / 252;
+    const probability = options
+      ? terminalThresholdProbability(spot, breakEven, modelVolatility, years, returnModel.logDrift, directionAbove)
+      : barrierTouchProbability(spot, target, returnModel.logDrift, returnModel.volatility, years);
+    return Number.isFinite(probability) ? { probability, samples: returnModel.observations } : null;
   }) : null;
   const chances = estimates?.every(Boolean) ? estimates.map(result => Math.max(0, Math.min(100, Math.round(result.probability)))) : null;
   const sampleCount = estimates?.filter(Boolean).reduce((minimum,result) => Math.min(minimum,result.samples),Infinity);
+  const resultLabel = options
+    ? premiumEntered ? "Estimated probability of profit at expiration" : "Estimated favorable-side probability at expiration"
+    : `${label} ${fmt(target)}`;
+  const volatilitySource = options && Number.isFinite(impliedVolatility) ? `${(impliedVolatility * 100).toFixed(1)}% listed-option IV` : `${returnModel ? (returnModel.volatility * 100).toFixed(1) : "N/A"}% realized volatility`;
   return `<div class="card clickable" data-detail="${detail}">
     <h3>${title} <span class="muted">· ${ticker}</span></h3><p class="subtle">${subtitle}</p>
     ${options ? `<div class="toolbar">${["Buy Call","Sell Call","Buy Put","Sell Put"].map(x => `<button class="${active(x, optionSide)}" data-option="${x}">${x}</button>`).join("")}</div>` : ""}
     <div class="row section"><span class="muted">${options ? "Strike" : "Target price"} · spot ${fmt(spot)}</span><strong>${fmt(target)}</strong><span class="${targetPct >= 0 ? "green" : "red"}">${targetPct >= 0 ? "+" : ""}${targetPct.toFixed(1)}%</span></div>
     <div class="custom-target"><label for="custom-${targetKind}">${options ? "Enter strike price" : "Enter target price"}</label><div><span>$</span><input id="custom-${targetKind}" type="number" min="0.01" step="0.01" value="${target.toFixed(2)}" data-custom-target="${targetKind}"><button class="primary" data-apply-target="${targetKind}">Apply</button></div></div>
+    ${options ? `<div class="custom-target"><label for="option-premium">Option premium per share (optional, for probability of profit)</label><div><span>$</span><input id="option-premium" type="number" min="0" step="0.01" placeholder="0.00" value="${premiumEntered ? optionPremium.toFixed(2) : ""}" data-option-premium><button class="primary" data-apply-premium>Apply</button></div></div>` : ""}
     <div class="toolbar">${[-10,-5,0,5,10,20].filter(v => !(!options && v === 0)).map(v => `<button class="${Math.abs(targetPct-v)<.05 ? "active" : ""}" data-target-kind="${targetKind}" data-target-percent="${v}">${v > 0 ? "+" : ""}${v}%</button>`).join("")}${options ? `<button data-reset-target="options">Reset to spot</button>` : ""}</div>
-    <div class="metric">${label} ${fmt(target)}</div>
-    ${chances ? `<div class="stack section">${horizons.map(([h],i) => `<div class="progress-row"><strong>${h}</strong><div class="bar"><span style="width:${chances[i]}%"></span></div><span>${chances[i]}%</span></div>`).join("")}</div><p class="subtle section">${options ? `Estimated probability of finishing beyond the strike. It blends 5 years of ${escapeHtml(historyProvider)} outcomes with ${Number.isFinite(impliedVolatility) ? `${(impliedVolatility*100).toFixed(1)}% near-money option IV` : "historical outcomes because option IV is unavailable"}.` : `Estimated probability of touching the target, measured from rolling outcomes in 5 years of ${escapeHtml(historyProvider)}.`} Recency-weighted · at least ${Number.isFinite(sampleCount) ? sampleCount.toLocaleString() : "available"} observations. This is a statistical estimate, not an AI forecast or guarantee.${options ? " Premiums, spreads, dividends, early exercise, and IV skew are not included." : ""}</p>` : `<div class="data-empty section"><p>Probability unavailable because market history did not return enough daily observations for this symbol.</p></div>`}
+    ${options ? `<div class="row section"><span class="muted">${premiumEntered ? "Expiration break-even" : "Threshold (premium not entered)"}</span><strong>${fmt(breakEven)}</strong></div>` : ""}
+    <div class="metric">${resultLabel}</div>
+    ${chances ? `<div class="stack section">${horizons.map(([h],i) => `<div class="progress-row"><strong>${h}</strong><div class="bar"><span style="width:${chances[i]}%"></span></div><span>${chances[i]}%</span></div>`).join("")}</div><p class="subtle section">${options ? `Uses ${escapeHtml(volatilitySource)} and the ${escapeHtml(optionSide)} expiration threshold. ${premiumEntered ? `Break-even includes the entered ${fmt(optionPremium)} premium.` : "Enter the option premium to convert this into an estimated probability of profit."}` : `Estimated probability of touching the target using ${escapeHtml(historyProvider)} timestamp-normalized returns and ${(returnModel.volatility * 100).toFixed(1)}% realized volatility.`} ${Number.isFinite(sampleCount) ? `${sampleCount.toLocaleString()} valid return observations.` : ""} This is a statistical estimate, not a forecast or guarantee.${options ? " Fees, dividends, early exercise, and volatility skew can change the realized outcome." : ""}</p>` : `<div class="data-empty section"><p>Probability unavailable because verified timestamped market history did not return enough observations for this symbol.</p></div>`}
   </div>`;
 }
 
@@ -1434,7 +1457,7 @@ function bindWorldChat() {
 }
 
 function bindDashboard() {
-  const resetCustomTargets = () => { customTargetPrices.price = null; customTargetPrices.options = null; };
+  const resetCustomTargets = () => { customTargetPrices.price = null; customTargetPrices.options = null; optionPremium = null; };
   const selectTicker = symbol => { ticker = ensureStock(symbol); gammaExposure.symbol = ticker; gammaExposure.data = null; gammaExposure.error = ""; resetCustomTargets(); dashboard(); refreshTickerData(ticker); refreshGammaExposure(ticker); };
   const analyzeTicker = () => selectTicker(document.querySelector("#ticker-input").value);
   document.querySelector("#analyze").onclick = analyzeTicker;
@@ -1482,6 +1505,14 @@ function bindDashboard() {
   };
   document.querySelectorAll("[data-apply-target]").forEach(button => button.onclick = () => applyCustomTarget(button.dataset.applyTarget));
   document.querySelectorAll("[data-custom-target]").forEach(input => input.onkeydown = event => { if (event.key === "Enter") applyCustomTarget(input.dataset.customTarget); });
+  const applyOptionPremium = () => {
+    const input = document.querySelector("[data-option-premium]");
+    const value = Number(input?.value);
+    optionPremium = input?.value.trim() === "" ? null : Number.isFinite(value) && value >= 0 ? value : optionPremium;
+    dashboard();
+  };
+  document.querySelector("[data-apply-premium]")?.addEventListener("click", applyOptionPremium);
+  document.querySelector("[data-option-premium]")?.addEventListener("keydown", event => { if (event.key === "Enter") applyOptionPremium(); });
   document.querySelectorAll("[data-option]").forEach(b => b.onclick = () => { optionSide = b.dataset.option; dashboard(); });
   document.querySelectorAll("[data-reset-target]").forEach(button => button.onclick = () => { customTargetPrices[button.dataset.resetTarget] = stocks[ticker].price; dashboard(); });
   document.querySelectorAll("[data-estimates-toggle]").forEach(button => button.onclick = () => { earningsShowEstimates = !earningsShowEstimates; dashboard(); });
