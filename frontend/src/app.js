@@ -1920,8 +1920,11 @@ function drawPriceChart() {
   const priceBottom = h - pad.bottom - volumeHeight - (volumeHeight ? 6 : 0);
   const scaleValues = candles.flatMap(row => [row.low, row.high]);
   Object.entries(averages).forEach(([key, values]) => { if (chartIndicators[key]) scaleValues.push(...values.filter(Number.isFinite)); });
-  const rawMin = Math.min(...scaleValues), rawMax = Math.max(...scaleValues), spread = Math.max(rawMax - rawMin, Math.abs(rawMax) * .015, 1);
-  const min = rawMin - spread * .08, max = rawMax + spread * .08;
+  const rawMin = Math.min(...scaleValues), rawMax = Math.max(...scaleValues);
+  const center = (rawMin + rawMax) / 2;
+  const minSpanPct = ({ "1D": .035, "5D": .045, "1M": .08, "6M": .14, "YTD": .16, "1Y": .2, "5Y": .45, "10Y": .65 })[chartRange] || .14;
+  const spread = Math.max(rawMax - rawMin, Math.abs(center) * minSpanPct, 1);
+  const min = center - spread * .62, max = center + spread * .62;
   const plotWidth = w - pad.left - pad.right;
   const x = index => pad.left + index * plotWidth / Math.max(1, candles.length - 1);
   const y = value => pad.top + (max - value) / (max - min) * (priceBottom - pad.top);
