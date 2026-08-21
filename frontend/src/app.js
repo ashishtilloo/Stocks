@@ -1922,7 +1922,7 @@ function drawPriceChart() {
   Object.entries(averages).forEach(([key, values]) => { if (chartIndicators[key]) scaleValues.push(...values.filter(Number.isFinite)); });
   const rawMin = Math.min(...scaleValues), rawMax = Math.max(...scaleValues);
   const center = (rawMin + rawMax) / 2;
-  const minSpanPct = ({ "1D": .035, "5D": .045, "1M": .08, "6M": .14, "YTD": .16, "1Y": .2, "5Y": .45, "10Y": .65 })[chartRange] || .14;
+  const minSpanPct = ({ "1D": .035, "5D": .05, "1M": .1, "6M": .24, "YTD": .26, "1Y": .32, "5Y": .55, "10Y": .75 })[chartRange] || .24;
   const spread = Math.max(rawMax - rawMin, Math.abs(center) * minSpanPct, 1);
   const min = center - spread * .62, max = center + spread * .62;
   const plotWidth = w - pad.left - pad.right;
