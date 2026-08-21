@@ -13,6 +13,7 @@ const validSymbol = value => {
 
 const seed = symbol => String(symbol || "AAPL").split("").reduce((sum, char, index) => sum + char.charCodeAt(0) * (index + 11), 0);
 const basePrice = symbol => ({ AAPL: 212.41, MSFT: 501.48, NVDA: 164.92, TSLA: 315.35, AMZN: 224.83, META: 728.56, GOOGL: 196.52, SPY: 628.86, QQQ: 556.42, "^GSPC": 6299.19 })[symbol] || 35 + (seed(symbol) % 460);
+const yahooSessionCache = { time: 0, data: null };
 
 function candleWindow(range) {
   const now = Math.floor(Date.now() / 1000);
@@ -699,10 +700,11 @@ function summarizeGammaPayload(payload, symbol, requestedDte, provider = "Market
     const gammaValue = Number(payload.gamma?.[index]);
     const iv = Number(payload.iv?.[index] || payload.impliedVolatility?.[index]);
     const dte = Number(payload.dte?.[index] || requestedDte);
+    const expiration = Number(payload.expiration?.[index] || payload.expirationDate?.[index]);
     const usableGamma = Number.isFinite(gammaValue) ? gammaValue : gamma(spot, strike, iv, Math.max(dte, 1) / 365);
     if (!Number.isFinite(spot) || !Number.isFinite(strike) || !Number.isFinite(openInterest) || !Number.isFinite(usableGamma)) continue;
     const signed = usableGamma * openInterest * 100 * spot * spot * 0.01 * (side.includes("put") ? -1 : 1);
-    rows.push({ strike, side: side.includes("put") ? "put" : "call", openInterest, gamma: usableGamma, iv, dte, signedGamma: signed });
+    rows.push({ strike, side: side.includes("put") ? "put" : "call", openInterest, gamma: usableGamma, iv, dte, expiration, signedGamma: signed });
   }
   if (!rows.length) throw new Error("Options chain returned no usable gamma rows");
   const byStrike = new Map();
@@ -717,26 +719,101 @@ function summarizeGammaPayload(payload, symbol, requestedDte, provider = "Market
   const grouped = [...byStrike.values()].sort((a, b) => a.strike - b.strike);
   const callWall = grouped.reduce((best, row) => row.callGamma > best.callGamma ? row : best, grouped[0]);
   const putWall = grouped.reduce((best, row) => row.putGamma < best.putGamma ? row : best, grouped[0]);
-  let gammaFlip = null;
-  for (let index = 1; index < grouped.length; index++) {
-    const previous = grouped[index - 1], current = grouped[index];
-    if (previous.netGamma === 0 || previous.netGamma * current.netGamma < 0) {
-      gammaFlip = current.strike;
-      break;
-    }
-  }
   const ivRows = rows.filter(row => Number.isFinite(row.iv) && row.openInterest > 0);
   const ivWeight = ivRows.reduce((sum, row) => sum + row.openInterest, 0);
+  const expirationTimestamp = rows.find(row => Number.isFinite(row.expiration))?.expiration;
+  const scenarioRows = rows.filter(row => Number.isFinite(row.iv) && row.iv > 0 && row.iv < 5 && Number.isFinite(row.dte) && row.dte > 0);
+  const curve = scenarioRows.length ? Array.from({ length: 61 }, (_, index) => {
+    const scenarioSpot = spot * (0.88 + index * 0.24 / 60);
+    const netGamma = scenarioRows.reduce((sum, row) => {
+      const scenarioGamma = gamma(scenarioSpot, row.strike, row.iv, Math.max(row.dte, 1) / 365);
+      return sum + (scenarioGamma || 0) * row.openInterest * 100 * scenarioSpot * scenarioSpot * 0.01 * (row.side === "put" ? -1 : 1);
+    }, 0);
+    return { spot: scenarioSpot, netGamma };
+  }) : grouped.map(row => ({ spot: row.strike, netGamma: row.netGamma }));
+  const crossings = [];
+  for (let index = 1; index < curve.length; index++) {
+    const previous = curve[index - 1], current = curve[index];
+    if (previous.netGamma === 0 || previous.netGamma * current.netGamma < 0) {
+      const weight = Math.abs(previous.netGamma) / (Math.abs(previous.netGamma) + Math.abs(current.netGamma) || 1);
+      crossings.push(previous.spot + (current.spot - previous.spot) * weight);
+    }
+  }
+  const gammaFlip = crossings.length ? crossings.reduce((closest, value) => Math.abs(value - spot) < Math.abs(closest - spot) ? value : closest) : null;
   return {
     s: "ok", symbol, provider, methodology: "Dealer-sign gamma x open interest x 100 x spot squared x 1% move",
-    requestedDte, underlyingPrice: spot, gammaFlip, callWall: callWall?.strike || null, putWall: putWall?.strike || null,
+    requestedDte, expiration: expirationTimestamp ? new Date(expirationTimestamp * 1000).toISOString() : null,
+    underlyingPrice: spot, gammaFlip, callWall: callWall?.strike || null, putWall: putWall?.strike || null,
     atmImpliedVolatility: ivWeight ? ivRows.reduce((sum, row) => sum + row.iv * row.openInterest, 0) / ivWeight : null,
     callGamma: grouped.reduce((sum, row) => sum + row.callGamma, 0),
     putGamma: grouped.reduce((sum, row) => sum + row.putGamma, 0),
     netGamma: grouped.reduce((sum, row) => sum + row.netGamma, 0),
-    contractCount: rows.length, strikes: grouped, curve: grouped.map(row => ({ spot: row.strike, netGamma: row.netGamma })),
+    contractCount: rows.length, strikes: grouped, curve,
     fetchedAt: new Date().toISOString()
   };
+}
+
+async function yahooSession(force = false) {
+  if (!force && yahooSessionCache.data && Date.now() - yahooSessionCache.time < 1800000) return yahooSessionCache.data;
+  const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36" };
+  const cookieResponse = await fetch("https://fc.yahoo.com", { headers, redirect: "manual" });
+  const setCookies = typeof cookieResponse.headers.getSetCookie === "function" ? cookieResponse.headers.getSetCookie() : [cookieResponse.headers.get("set-cookie")].filter(Boolean);
+  const cookie = setCookies.map(value => value.split(";")[0]).join("; ");
+  if (!cookie) throw new Error("Yahoo Finance did not issue a session cookie");
+  const crumbResponse = await fetch("https://query2.finance.yahoo.com/v1/test/getcrumb", { headers: { ...headers, Cookie: cookie } });
+  const crumb = (await crumbResponse.text()).trim();
+  if (!crumbResponse.ok || !crumb || /unauthorized|error/i.test(crumb)) throw new Error("Yahoo Finance did not issue a valid crumb");
+  yahooSessionCache.time = Date.now();
+  yahooSessionCache.data = { cookie, crumb };
+  return yahooSessionCache.data;
+}
+
+async function yahooOptions(symbol, expiration, retry = true) {
+  const session = await yahooSession();
+  const url = new URL(`https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(symbol)}`);
+  if (expiration) url.searchParams.set("date", String(expiration));
+  url.searchParams.set("crumb", session.crumb);
+  const response = await fetch(url, {
+    headers: { Accept: "application/json", Cookie: session.cookie, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36" }
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (retry && (response.status === 401 || /crumb/i.test(payload?.finance?.error?.description || ""))) {
+    await yahooSession(true);
+    return yahooOptions(symbol, expiration, false);
+  }
+  if (!response.ok) throw new Error(payload?.finance?.error?.description || `Yahoo options request failed (${response.status})`);
+  const result = payload?.optionChain?.result?.[0];
+  if (!result) throw new Error("Yahoo Finance returned no listed options chain");
+  return result;
+}
+
+async function yahooGamma(symbol, requestedDte) {
+  const first = await yahooOptions(symbol);
+  const target = Math.floor(Date.now() / 1000) + requestedDte * 86400;
+  const expirations = (first.expirationDates || []).map(Number).filter(Number.isFinite);
+  if (!expirations.length) throw new Error("No listed option expirations were returned for this ticker");
+  const expiration = expirations.reduce((best, value) => Math.abs(value - target) < Math.abs(best - target) ? value : best, expirations[0]);
+  const result = first.options?.[0]?.expirationDate === expiration ? first : await yahooOptions(symbol, expiration);
+  const spot = Number(result.quote?.regularMarketPrice);
+  if (!Number.isFinite(spot) || spot <= 0) throw new Error("The Yahoo options chain did not include an underlying price");
+  const dte = Math.max(1, Math.round((expiration - Date.now() / 1000) / 86400));
+  const rows = [...(result.options?.[0]?.calls || []).map(row => ({ ...row, side: "call" })), ...(result.options?.[0]?.puts || []).map(row => ({ ...row, side: "put" }))]
+    .filter(row => Number(row.openInterest) > 0 && Number(row.impliedVolatility) > 0 && Number(row.strike) > 0);
+  const payload = { strike: [], side: [], openInterest: [], gamma: [], iv: [], dte: [], expiration: [], underlyingPrice: [] };
+  rows.forEach(row => {
+    const iv = Number(row.impliedVolatility);
+    const contractGamma = gamma(spot, Number(row.strike), iv, dte / 365);
+    if (!Number.isFinite(contractGamma)) return;
+    payload.strike.push(Number(row.strike));
+    payload.side.push(row.side);
+    payload.openInterest.push(Number(row.openInterest));
+    payload.gamma.push(contractGamma);
+    payload.iv.push(iv);
+    payload.dte.push(dte);
+    payload.expiration.push(expiration);
+    payload.underlyingPrice.push(spot);
+  });
+  return summarizeGammaPayload(payload, symbol, requestedDte, "Yahoo Finance options fallback");
 }
 
 async function marketDataGamma(env, symbol, requestedDte) {
@@ -884,7 +961,12 @@ export async function handleApi(context) {
     try {
       return json(await marketDataGamma(context.env, symbol, requestedDte));
     } catch (error) {
-      return json({ ...demoGamma(symbol, requestedDte), detail: `Live gamma exposure unavailable: ${error.message}` });
+      try {
+        const data = await yahooGamma(symbol, requestedDte);
+        return json({ ...data, detail: `Market Data unavailable: ${error.message}. Yahoo options fallback used.` });
+      } catch (fallbackError) {
+        return json({ ...demoGamma(symbol, requestedDte), detail: `Live gamma exposure unavailable: ${error.message}. Yahoo fallback: ${fallbackError.message}` });
+      }
     }
   }
   if (pathname === "/api/firebase/config") return json({ configured: Boolean(context.env.FIREBASE_API_KEY && context.env.FIREBASE_AUTH_DOMAIN && context.env.FIREBASE_PROJECT_ID && context.env.FIREBASE_APP_ID), config: { apiKey: context.env.FIREBASE_API_KEY || "", authDomain: context.env.FIREBASE_AUTH_DOMAIN || "", projectId: context.env.FIREBASE_PROJECT_ID || "", storageBucket: context.env.FIREBASE_STORAGE_BUCKET || "", messagingSenderId: context.env.FIREBASE_MESSAGING_SENDER_ID || "", appId: context.env.FIREBASE_APP_ID || "" } });
