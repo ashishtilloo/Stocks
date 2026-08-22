@@ -867,10 +867,6 @@ function dashboard() {
   const directionalValue = key => directional.available ? `${probs[key]}%` : "N/A";
   const swingValue = key => directional.available ? `+/-${swings[key]}%` : "N/A";
   const trend = trendAnalysis(s, technical);
-  const diagnostics = marketData.diagnostics[ticker] || [];
-  const diagnosticSummary = diagnostics.length
-    ? diagnostics.map(item => `${item.ok ? "OK" : "Fail"} ${item.provider}${item.authApplied ? " auth" : ""}`).join(" / ")
-    : "Awaiting provider diagnostics";
   const priceTarget = customTargetPrices.price ?? s.price * 1.05;
   const optionsTarget = customTargetPrices.options ?? s.price * 1.05;
   const gamma = gammaExposure.data?.symbol === gammaExposure.symbol ? gammaExposure.data : null;
@@ -898,7 +894,6 @@ function dashboard() {
         <div class="quote-price">${fmt(s.price)}</div>
         <p class="${s.change >= 0 ? "green" : "red"}">${s.change >= 0 ? "+" : ""}${s.change.toFixed(2)} (${pct(s.pct)})</p>
         <p class="subtle section">${escapeHtml(quoteProvider)} market snapshot for ${ticker}. ${escapeHtml(freshnessLabel)}.</p>
-        <p class="subtle data-diagnostics">${escapeHtml(diagnosticSummary)}</p>
         <div class="stat-grid">
           ${[["Open", fmt(s.open)], ["High", fmt(s.high)], ["Low", fmt(s.low)], ["Prev Close", fmt(s.prev)], ["Day Range", `${fmt(s.low)} - ${fmt(s.high)}`], ["52W Range", s.weekLow && s.weekHigh ? `${fmt(s.weekLow)} - ${fmt(s.weekHigh)}` : "N/A"], ["Volume", compactNumber(s.volume)], ["Market Cap", s.type === "CRYPTO" ? "N/A" : marketCapLabel(s.marketCap)]].map(([k,v]) => `<div class="stat"><div class="metric">${k}</div><strong>${v}</strong></div>`).join("")}
         </div>
