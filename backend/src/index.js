@@ -111,19 +111,6 @@ function demoMetrics(symbol) {
   return { metric: { epsTTM: 2 + (seed % 1800) / 100, epsGrowth5Y: -4 + (seed % 2600) / 100, peTTM: 12 + (seed % 3200) / 100, revenuePerShareTTM: 15 + (seed % 8000) / 100, "52WeekHigh": demoBasePrice(symbol) * 1.22, "52WeekLow": demoBasePrice(symbol) * 0.72 } };
 }
 
-function demoEarnings(symbol) {
-  const seed = symbolSeed(symbol);
-  return Array.from({ length: 8 }, (_, index) => {
-    const quarterIndex = 7 - index;
-    const date = new Date();
-    date.setMonth(date.getMonth() - quarterIndex * 3);
-    const quarter = Math.floor(date.getMonth() / 3) + 1;
-    const actual = 1 + (seed % 220) / 100 + index * 0.08;
-    const estimate = actual - 0.05 + ((index % 3) - 1) * 0.03;
-    return { symbol, year: date.getFullYear(), quarter, period: `${date.getFullYear()} Q${quarter}`, actual, estimate, surprise: actual - estimate };
-  }).reverse();
-}
-
 function demoNews(symbol) {
   const today = Math.floor(Date.now() / 1000);
   return [
@@ -811,6 +798,7 @@ async function alphaVantageOverview(symbol, ttlMs = 86400000) {
   const metrics = { metric: {
     epsTTM: Number(overview.EPS),
     epsGrowthYoY: Number(overview.QuarterlyEarningsGrowthYOY) * 100,
+    revenueGrowthYoY: Number(overview.QuarterlyRevenueGrowthYOY) * 100,
     peTTM: Number(overview.PERatio),
     revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : Number(overview.RevenuePerShareTTM),
     "52WeekHigh": Number(overview["52WeekHigh"]),
@@ -820,22 +808,37 @@ async function alphaVantageOverview(symbol, ttlMs = 86400000) {
 }
 
 async function alphaVantageEarnings(symbol, ttlMs = 3600000) {
-  const data = await alphaVantage({ function: "EARNINGS", symbol: alphaVantageSymbol(symbol) }, ttlMs);
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const [data, income] = await Promise.all([
+    alphaVantage({ function: "EARNINGS", symbol: sourceSymbol }, ttlMs),
+    alphaVantage({ function: "INCOME_STATEMENT", symbol: sourceSymbol }, ttlMs)
+  ]);
   const rows = Array.isArray(data.quarterlyEarnings) ? data.quarterlyEarnings : [];
   if (!rows.length) throw new Error("Alpha Vantage returned no earnings records");
+  const revenues = (Array.isArray(income.quarterlyReports) ? income.quarterlyReports : []).map(row => ({ time: Date.parse(`${row.fiscalDateEnding}T00:00:00Z`), revenue: Number(row.totalRevenue) })).filter(row => Number.isFinite(row.time) && Number.isFinite(row.revenue) && row.revenue >= 0);
+  if (!revenues.length) throw new Error("Alpha Vantage returned no quarterly revenue records");
   return rows.slice(0, 12).map(row => {
     const date = new Date(`${row.fiscalDateEnding}T00:00:00Z`);
     const quarter = Math.floor(date.getUTCMonth() / 3) + 1;
     const actual = Number(row.reportedEPS);
     const estimate = Number(row.estimatedEPS);
+    const time = date.getTime();
+    const revenueRow = revenues.reduce((best, item) => Math.abs(item.time - time) < Math.abs((best?.time ?? Infinity) - time) ? item : best, null);
+    const priorRevenue = revenues.filter(item => { const days = (time - item.time) / 86400000; return days >= 300 && days <= 430; }).reduce((best, item) => Math.abs((time - item.time) / 86400000 - 365.25) < Math.abs((time - (best?.time ?? -Infinity)) / 86400000 - 365.25) ? item : best, null);
+    const revenue = revenueRow && Math.abs(revenueRow.time - time) <= 75 * 86400000 ? revenueRow.revenue : null;
     return {
       symbol,
       year: date.getUTCFullYear(),
       quarter,
-      period: `${date.getUTCFullYear()} Q${quarter}`,
+      period: row.fiscalDateEnding,
+      fiscalDateEnding: row.fiscalDateEnding,
+      reportedDate: row.reportedDate || null,
       actual,
       estimate,
-      surprise: Number.isFinite(actual) && Number.isFinite(estimate) ? actual - estimate : Number(row.surprise)
+      surprise: Number.isFinite(actual) && Number.isFinite(estimate) ? actual - estimate : Number(row.surprise),
+      revenue,
+      revenueGrowthYoY: Number.isFinite(revenue) && Number.isFinite(priorRevenue?.revenue) && priorRevenue.revenue !== 0 ? (revenue / priorRevenue.revenue - 1) * 100 : null,
+      provider: "Alpha Vantage"
     };
   });
 }
@@ -1022,6 +1025,19 @@ async function handleMarketStock(req, res, requestUrl) {
     }
   }
 
+  let earningsProvider = Array.isArray(earnings) && earnings.length ? "Alpha Vantage" : "Unavailable";
+  if (!Array.isArray(earnings) || !earnings.length) {
+    dataDiagnostics.push({ provider: "Alpha Vantage earnings", ok: false, authApplied: Boolean(alphaVantageKey()), message: earnings?.message || "Reported earnings or quarterly revenue unavailable" });
+    try {
+      earnings = await yahooEarnings(symbol, 3600000);
+      earningsProvider = "Yahoo Finance";
+      dataDiagnostics.push({ provider: "Yahoo Finance earnings", ok: true, authApplied: false, message: "Reported EPS, estimates, and quarterly revenue returned" });
+    } catch (error) {
+      earnings = [];
+      dataDiagnostics.push({ provider: "Yahoo Finance earnings", ok: false, authApplied: false, message: error.message });
+    }
+  }
+
   const chartMeta = candles?.meta || {};
   const basicProfile = {
     name: chartMeta.longName || chartMeta.shortName || symbol,
@@ -1043,13 +1059,14 @@ async function handleMarketStock(req, res, requestUrl) {
     quoteProvider: effectiveQuote?.provider || "Market data",
     candleProvider: candles?.provider || null,
     fundamentalsProvider,
+    earningsProvider,
     dataDiagnostics,
     quote: effectiveQuote,
     profile: usablePayload(overview?.profile) ? overview.profile : basicProfile,
     metrics: usablePayload(overview?.metrics) ? overview.metrics : { metric: {} },
     candles,
     probabilityCandles,
-    earnings: Array.isArray(earnings) ? earnings : demoEarnings(symbol),
+    earnings: Array.isArray(earnings) ? earnings : [],
     news: Array.isArray(news) ? news.slice(0, 20) : demoNews(symbol),
     sentiment: { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 },
     recommendations: [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }]
@@ -1263,12 +1280,43 @@ async function yahooFundamentals(symbol, ttlMs = 3600000, retry = true) {
     metrics: { metric: {
       epsTTM: yahooRawNumber(statistics.trailingEps),
       epsGrowthYoY: Number.isFinite(yahooRawNumber(financial.earningsGrowth)) ? yahooRawNumber(financial.earningsGrowth) * 100 : null,
+      revenueGrowthYoY: Number.isFinite(yahooRawNumber(financial.revenueGrowth)) ? yahooRawNumber(financial.revenueGrowth) * 100 : null,
       peTTM: yahooRawNumber(summary.trailingPE),
       revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : yahooRawNumber(financial.revenuePerShare),
       "52WeekHigh": yahooRawNumber(summary.fiftyTwoWeekHigh),
       "52WeekLow": yahooRawNumber(summary.fiftyTwoWeekLow)
     } }
   };
+  cache.set(cacheKey, { time: Date.now(), data });
+  return data;
+}
+
+async function yahooEarnings(symbol, ttlMs = 3600000, retry = true) {
+  const cacheKey = `yahoo:earnings:${symbol}`;
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.time < ttlMs) return cached.data;
+  const session = await yahooSession();
+  const url = new URL(`https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}`);
+  url.searchParams.set("modules", "earningsHistory,incomeStatementHistoryQuarterly,financialData");
+  url.searchParams.set("crumb", session.crumb);
+  const response = await fetch(url, { headers: { Accept: "application/json", Cookie: session.cookie, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36" }, signal: AbortSignal.timeout(12000) });
+  const payload = await response.json().catch(() => ({}));
+  const errorMessage = payload?.quoteSummary?.error?.description || payload?.finance?.error?.description || "";
+  if (retry && (response.status === 401 || /crumb|unauthorized/i.test(errorMessage))) { await yahooSession(true); return yahooEarnings(symbol, ttlMs, false); }
+  if (!response.ok) throw new Error(errorMessage || `Yahoo earnings request failed (${response.status})`);
+  const result = payload?.quoteSummary?.result?.[0];
+  const history = [...(result?.earningsHistory?.history || [])].sort((a, b) => yahooRawNumber(b.quarter) - yahooRawNumber(a.quarter));
+  const statements = result?.incomeStatementHistoryQuarterly?.incomeStatementHistory || [];
+  if (!Array.isArray(history) || !history.length) throw new Error("Yahoo Finance returned no earnings history");
+  const revenues = statements.map(row => ({ time: yahooRawNumber(row.endDate) * 1000, revenue: yahooRawNumber(row.totalRevenue) })).filter(row => Number.isFinite(row.time) && Number.isFinite(row.revenue) && row.revenue >= 0);
+  const latestRevenueGrowth = Number.isFinite(yahooRawNumber(result?.financialData?.revenueGrowth)) ? yahooRawNumber(result.financialData.revenueGrowth) * 100 : null;
+  const data = history.slice(0, 12).map((row, index) => {
+    const date = new Date(yahooRawNumber(row.quarter) * 1000), time = date.getTime();
+    const revenueRow = revenues.reduce((best, item) => Math.abs(item.time - time) < Math.abs((best?.time ?? Infinity) - time) ? item : best, null);
+    const priorRevenue = revenues.filter(item => { const days = (time - item.time) / 86400000; return days >= 300 && days <= 430; }).reduce((best, item) => Math.abs((time - item.time) / 86400000 - 365.25) < Math.abs((time - (best?.time ?? -Infinity)) / 86400000 - 365.25) ? item : best, null);
+    const revenue = revenueRow && Math.abs(revenueRow.time - time) <= 75 * 86400000 ? revenueRow.revenue : null;
+    return { symbol, year: date.getUTCFullYear(), quarter: Math.floor(date.getUTCMonth() / 3) + 1, period: date.toISOString().slice(0, 10), fiscalDateEnding: date.toISOString().slice(0, 10), reportedDate: null, actual: yahooRawNumber(row.epsActual), estimate: yahooRawNumber(row.epsEstimate), surprise: yahooRawNumber(row.epsDifference), revenue, revenueGrowthYoY: Number.isFinite(revenue) && Number.isFinite(priorRevenue?.revenue) && priorRevenue.revenue !== 0 ? (revenue / priorRevenue.revenue - 1) * 100 : index === 0 ? latestRevenueGrowth : null, revenueGrowthBasis: Number.isFinite(priorRevenue?.revenue) ? "Quarterly YoY" : index === 0 && Number.isFinite(latestRevenueGrowth) ? "Latest provider YoY" : null, provider: "Yahoo Finance" };
+  });
   cache.set(cacheKey, { time: Date.now(), data });
   return data;
 }

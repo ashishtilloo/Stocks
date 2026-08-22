@@ -104,6 +104,7 @@ const customTargetPrices = { price: null, options: null };
 let optionSide = "Buy Call";
 let optionPremium = null;
 let earningsShowEstimates = true;
+let earningsView = "eps";
 const gammaExposure = { symbol: "AAPL", dte: 30, loading: false, data: null, error: "", requestId: 0 };
 const macroRanges = { unemployment: "2Y", inflation: "2Y", fed: "2Y", treasury: "2Y" };
 let spRange = "2Y";
@@ -130,7 +131,7 @@ const worldChatState = {
 worldChatState.seenMessageIds = new Set();
 localStorage.setItem("marketlens-chat-session", worldChatState.sessionId);
 let worldChatTimer = null;
-const marketData = { configured: null, loading: false, error: "", candles: {}, probabilityCandles: {}, diagnostics: {}, news: {}, sentiment: {}, recommendations: {}, earnings: {}, liveSymbols: new Set(), spCandles: null, spLoading: false, spError: "", macro: { loading: false, error: "", data: null, sectors: null, sectorError: "" }, cnn: { loading: false, error: "", data: null } };
+const marketData = { configured: null, loading: false, error: "", candles: {}, probabilityCandles: {}, diagnostics: {}, news: {}, sentiment: {}, recommendations: {}, earnings: {}, earningsProviders: {}, liveSymbols: new Set(), spCandles: null, spLoading: false, spError: "", macro: { loading: false, error: "", data: null, sectors: null, sectorError: "" }, cnn: { loading: false, error: "", data: null } };
 let marketEventSource = null;
 let priceChartResizeObserver = null;
 let watchlistRefreshPromise = null;
@@ -223,6 +224,11 @@ const isFiniteValue = value => value !== null && value !== "" && Number.isFinite
 const fmt = (n) => !isFiniteValue(n) ? "N/A" : Number(n) >= 10000 ? "$" + Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 }) : "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const pct = (n) => !isFiniteValue(n) ? "N/A" : (Number(n) >= 0 ? "+" : "") + Number(n).toFixed(2) + "%";
 const compactNumber = (n) => !Number.isFinite(n) ? "N/A" : n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : n.toFixed(0);
+const earningsPeriodLabel = row => {
+  const raw = row?.fiscalDateEnding || row?.period;
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(raw || "")) ? new Date(`${raw}T00:00:00Z`) : null;
+  return date && Number.isFinite(date.getTime()) ? date.toLocaleDateString(undefined, { month: "short", year: "numeric", timeZone: "UTC" }) : String(raw || `${row?.year || ""} Q${row?.quarter || ""}`);
+};
 const marketCapLabel = n => !Number.isFinite(n) ? "N/A" : n >= 1e6 ? `$${(n / 1e6).toFixed(2)}T` : `$${(n / 1e3).toFixed(2)}B`;
 const active = (value, current) => value === current ? "active" : "";
 const escapeHtml = (value) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char]));
@@ -270,7 +276,7 @@ function ensureStock(value) {
     change: Number.isFinite(starter.change) ? starter.change : null,
     pct: Number.isFinite(starter.pct) ? starter.pct : null,
     open: null, high: null, low: null, prev: null, sector: starter.sector || "", industry: starter.sector || "",
-    eps: null, growth: null, graham: null
+    eps: null, growth: null, revenueGrowth: null, graham: null
   };
   companyMetrics[symbol] = { revenue: "N/A", pe: "N/A", provider: "Unavailable" };
   return symbol;
@@ -488,6 +494,7 @@ async function refreshTickerData(symbol, rerender = true) {
       industry: profile.industry || profile.finnhubIndustry || "N/A",
       eps: metricNumber(metrics.epsTTM),
       growth: metricNumber(metrics.epsGrowthYoY),
+      revenueGrowth: metricNumber(metrics.revenueGrowthYoY),
       weekHigh: Number(metrics["52WeekHigh"]) || null,
       weekLow: Number(metrics["52WeekLow"]) || null,
       marketCap: Number(profile.marketCapitalization) || Number(metrics.marketCapitalization) || null,
@@ -514,7 +521,15 @@ async function refreshTickerData(symbol, rerender = true) {
     if (Array.isArray(payload.news)) marketData.news[requested] = payload.news;
     if (usablePayload(payload.sentiment)) marketData.sentiment[requested] = payload.sentiment;
     if (Array.isArray(payload.recommendations)) marketData.recommendations[requested] = payload.recommendations;
-    if (Array.isArray(payload.earnings)) marketData.earnings[requested] = payload.earnings;
+    if (Array.isArray(payload.earnings)) marketData.earnings[requested] = payload.earnings.map(row => ({
+      ...row,
+      actual: isFiniteValue(row.actual) ? Number(row.actual) : NaN,
+      estimate: isFiniteValue(row.estimate) ? Number(row.estimate) : NaN,
+      surprise: isFiniteValue(row.surprise) ? Number(row.surprise) : NaN,
+      revenue: isFiniteValue(row.revenue) ? Number(row.revenue) : NaN,
+      revenueGrowthYoY: isFiniteValue(row.revenueGrowthYoY) ? Number(row.revenueGrowthYoY) : NaN
+    }));
+    marketData.earningsProviders[requested] = payload.earningsProvider || payload.earnings?.[0]?.provider || "Unavailable";
     if (hasLiveQuote) {
       stockRefreshTimes[requested] = Date.now();
       marketData.liveSymbols.add(requested);
@@ -860,7 +875,9 @@ function dashboard() {
   const atrRuleText = Number.isFinite(atrDistance)
     ? `${atrDistance.toFixed(2)} ATR from 50 MA - ${atrRulePasses ? "passes" : "extended"}`
     : "Needs 50 sessions and ATR";
-  const earningsRows = (marketData.earnings[ticker] || []).filter(row => Number.isFinite(Number(row.actual)) || Number.isFinite(Number(row.estimate))).slice(0, 8);
+  const earningsRows = (marketData.earnings[ticker] || []).filter(row => isFiniteValue(row.actual) || isFiniteValue(row.estimate) || isFiniteValue(row.revenue)).slice(0, 8);
+  const earningsProvider = marketData.earningsProviders[ticker] || earningsRows[0]?.provider || "Unavailable";
+  const hasRevenueGrowth = earningsRows.some(row => isFiniteValue(row.revenueGrowthYoY));
   const directional = directionalModel(s, technical);
   const probs = directional.probabilities;
   const swings = directional.swings;
@@ -981,8 +998,9 @@ function dashboard() {
         </div>
       </div>
       <div class="card clickable" data-detail="earnings">
-        <h3>Earnings Reports</h3><p class="subtle">Reported and estimated quarterly EPS for ${ticker}</p>
-        ${earningsRows.length ? `<div class="earnings-controls toolbar section"><button class="${earningsShowEstimates ? "active" : ""}" data-estimates-toggle>${earningsShowEstimates ? "Hide Estimates" : "Show Estimates"}</button><span class="subtle">${earningsShowEstimates ? "Actual EPS and estimate bars are visible." : "Only actual EPS bars are visible."}</span></div><div class="earnings-legend section"><span class="actual">Actual EPS</span>${earningsShowEstimates ? `<span class="estimate">Estimate</span>` : ""}<strong>${earningsRows.length} quarters</strong></div><canvas id="earnings-chart" class="earnings-chart" aria-label="${ticker} quarterly actual and estimated EPS"></canvas><div class="earnings-values">${earningsRows.slice().reverse().map(row => `<div><span>${escapeHtml(String(row.period || `${row.year || ""} Q${row.quarter || ""}`))}</span><strong>${fmt(Number(row.actual))}${earningsShowEstimates ? ` / ${fmt(Number(row.estimate))}` : ""}</strong><small class="${Number(row.surprise) >= 0 ? "green" : "amber"}">${earningsShowEstimates && Number.isFinite(Number(row.surprise)) ? `${Number(row.surprise) >= 0 ? "+" : ""}${Number(row.surprise).toFixed(2)} surprise` : earningsShowEstimates ? "Estimate unavailable" : "Estimate hidden"}</small></div>`).join("")}</div>` : `<div class="data-empty section"><p>Alpha Vantage did not return earnings records for this symbol.</p></div>`}
+        <h3>Earnings Reports</h3><p class="subtle">Verified quarterly EPS, estimates, revenue, and year-over-year revenue growth for ${ticker}</p>
+        <div class="row section"><span class="muted">Latest revenue growth (YoY)</span><strong class="${Number(s.revenueGrowth) >= 0 ? "green" : "amber"}">${isFiniteValue(s.revenueGrowth) ? `${Number(s.revenueGrowth) >= 0 ? "+" : ""}${Number(s.revenueGrowth).toFixed(1)}%` : "N/A"}</strong></div>
+        ${earningsRows.length ? `<div class="earnings-controls toolbar section"><div class="segmented"><button class="${active("eps", earningsView)}" data-earnings-view="eps">EPS</button><button class="${active("revenue", earningsView)}" data-earnings-view="revenue" ${hasRevenueGrowth ? "" : "disabled"}>Revenue Growth</button></div>${earningsView === "eps" ? `<button class="${earningsShowEstimates ? "active" : ""}" data-estimates-toggle>${earningsShowEstimates ? "Hide Estimates" : "Show Estimates"}</button>` : ""}<span class="subtle">Source: ${escapeHtml(earningsProvider)}</span></div>${earningsView === "eps" ? `<div class="earnings-legend section"><span class="actual">Actual EPS</span>${earningsShowEstimates ? `<span class="estimate">Estimate</span>` : ""}<strong>${earningsRows.length} reported quarters</strong></div>` : `<div class="earnings-legend section"><span class="revenue">Revenue growth YoY</span><strong>${earningsRows.filter(row => Number.isFinite(Number(row.revenueGrowthYoY))).length} reported growth periods</strong></div>`}<canvas id="earnings-chart" class="earnings-chart" aria-label="${ticker} ${earningsView === "eps" ? "quarterly actual and estimated EPS" : "quarterly year-over-year revenue growth"}"></canvas><div class="earnings-values">${earningsRows.slice().reverse().map(row => `<div><span>${escapeHtml(earningsPeriodLabel(row))}</span>${earningsView === "eps" ? `<strong>${fmt(Number(row.actual))}${earningsShowEstimates ? ` / ${fmt(Number(row.estimate))}` : ""}</strong><small class="${Number(row.surprise) >= 0 ? "green" : "amber"}">${earningsShowEstimates && Number.isFinite(Number(row.surprise)) ? `${Number(row.surprise) >= 0 ? "+" : ""}${Number(row.surprise).toFixed(2)} surprise` : earningsShowEstimates ? "Estimate unavailable" : "Estimate hidden"}</small>` : `<strong>${Number.isFinite(Number(row.revenue)) ? `$${compactNumber(Number(row.revenue))}` : "Revenue N/A"}</strong><small class="${Number(row.revenueGrowthYoY) >= 0 ? "green" : "amber"}">${Number.isFinite(Number(row.revenueGrowthYoY)) ? `${Number(row.revenueGrowthYoY) >= 0 ? "+" : ""}${Number(row.revenueGrowthYoY).toFixed(1)}% YoY` : "Prior-year comparison unavailable"}</small>${row.revenueGrowthBasis ? `<small>${escapeHtml(row.revenueGrowthBasis)}</small>` : ""}`}${row.reportedDate ? `<small>Reported ${escapeHtml(new Date(`${row.reportedDate}T00:00:00Z`).toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric",timeZone:"UTC"}))}</small>` : ""}</div>`).join("")}</div>` : `<div class="data-empty section"><p>Verified reported earnings are unavailable for this symbol. No generated earnings records are displayed.</p></div>`}
       </div>
     </section>
 
@@ -1511,6 +1529,7 @@ function bindDashboard() {
   document.querySelectorAll("[data-option]").forEach(b => b.onclick = () => { optionSide = b.dataset.option; dashboard(); });
   document.querySelectorAll("[data-reset-target]").forEach(button => button.onclick = () => { customTargetPrices[button.dataset.resetTarget] = stocks[ticker].price; dashboard(); });
   document.querySelectorAll("[data-estimates-toggle]").forEach(button => button.onclick = () => { earningsShowEstimates = !earningsShowEstimates; dashboard(); });
+  document.querySelectorAll("[data-earnings-view]").forEach(button => button.onclick = () => { earningsView = button.dataset.earningsView; dashboard(); });
 }
 
 function bindPaper() {
@@ -1553,7 +1572,7 @@ function openDetail(kind) {
   const atrStatus = Number.isFinite(atrDistance) ? (atrRulePasses ? "Pass" : "Extended") : "Unavailable";
   const tsiState = !Number.isFinite(technical.tsi) ? "Unavailable" : technical.tsi >= 10 ? "Bullish" : technical.tsi <= -10 ? "Bearish" : "Neutral";
   const metricPrice = value => Number.isFinite(value) ? fmt(value) : "N/A";
-  const earningsRows = (marketData.earnings[ticker] || []).filter(row => Number.isFinite(Number(row.actual)) || Number.isFinite(Number(row.estimate))).slice(0, 12);
+  const earningsRows = (marketData.earnings[ticker] || []).filter(row => isFiniteValue(row.actual) || isFiniteValue(row.estimate) || isFiniteValue(row.revenue)).slice(0, 12);
   const copy = {
     "quote": {
       title: `${s.name} quote details`,
@@ -1579,7 +1598,7 @@ function openDetail(kind) {
     },
     "earnings": {
       title: "Earnings reports",
-      body: `<p>Alpha Vantage quarterly EPS actuals and estimates for ${ticker}.</p><table class="table section"><thead><tr><th>Period</th><th>Actual EPS</th><th>Estimate</th><th>Surprise</th></tr></thead><tbody>${earningsRows.map(row => `<tr><td>${escapeHtml(String(row.period || `${row.year || ""} Q${row.quarter || ""}`))}</td><td>${fmt(Number(row.actual))}</td><td>${fmt(Number(row.estimate))}</td><td>${Number.isFinite(Number(row.surprise)) ? Number(row.surprise).toFixed(2) : "N/A"}</td></tr>`).join("")}</tbody></table>`
+      body: `<p>Verified quarterly results from ${escapeHtml(marketData.earningsProviders[ticker] || earningsRows[0]?.provider || "an available provider")}.</p><table class="table section"><thead><tr><th>Fiscal period</th><th>Actual EPS</th><th>Estimate</th><th>Surprise</th><th>Revenue</th><th>Revenue growth YoY</th></tr></thead><tbody>${earningsRows.map(row => `<tr><td>${escapeHtml(earningsPeriodLabel(row))}</td><td>${fmt(Number(row.actual))}</td><td>${fmt(Number(row.estimate))}</td><td>${Number.isFinite(Number(row.surprise)) ? Number(row.surprise).toFixed(2) : "N/A"}</td><td>${Number.isFinite(Number(row.revenue)) ? `$${compactNumber(Number(row.revenue))}` : "N/A"}</td><td>${Number.isFinite(Number(row.revenueGrowthYoY)) ? `${Number(row.revenueGrowthYoY).toFixed(1)}%` : "N/A"}</td></tr>`).join("")}</tbody></table>`
     },
     "target-probability": {
       title: "Price target probability",
@@ -2002,17 +2021,32 @@ function drawPriceChart() {
 
 function drawEarningsChart() {
   const chart = setupCanvas("earnings-chart");
-  const rows = (marketData.earnings[ticker] || []).filter(row => Number.isFinite(Number(row.actual)) || Number.isFinite(Number(row.estimate))).slice(0, 8).reverse();
+  const rows = (marketData.earnings[ticker] || []).filter(row => earningsView === "revenue" ? isFiniteValue(row.revenueGrowthYoY) : isFiniteValue(row.actual) || isFiniteValue(row.estimate)).slice(0, 8).reverse();
   if (!chart || !rows.length) return;
   const { ctx, w, h } = chart, pad = { left: 44, right: 14, top: 16, bottom: 36 };
-  const values = rows.flatMap(row => earningsShowEstimates ? [Number(row.actual), Number(row.estimate)] : [Number(row.actual)]).filter(Number.isFinite);
+  const values = earningsView === "revenue" ? rows.map(row => Number(row.revenueGrowthYoY)) : rows.flatMap(row => earningsShowEstimates ? [Number(row.actual), Number(row.estimate)] : [Number(row.actual)]).filter(Number.isFinite);
   const min = Math.min(0, ...values), max = Math.max(0, ...values), span = Math.max(.01, max - min);
   const y = value => pad.top + (max - value) / span * (h - pad.top - pad.bottom);
   const group = (w - pad.left - pad.right) / rows.length, bar = Math.max(5, Math.min(18, group * .25));
   ctx.font = "10px ui-monospace, SFMono-Regular, Consolas, monospace";
-  for (let i = 0; i < 4; i++) { const value = max - i * span / 3, yy = y(value); ctx.strokeStyle = "rgba(148,163,184,.12)"; ctx.setLineDash([3,5]); ctx.beginPath(); ctx.moveTo(pad.left,yy); ctx.lineTo(w-pad.right,yy); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle="#8f98aa"; ctx.textAlign="right"; ctx.fillText(value.toFixed(2),pad.left-7,yy+3); }
-  rows.forEach((row,index) => { const xx=pad.left+group*(index+.5), actual=Number(row.actual), estimate=Number(row.estimate), zero=y(0); if(Number.isFinite(actual)){const yy=y(actual);ctx.fillStyle="#5999e0";ctx.fillRect(xx-(earningsShowEstimates?bar+2:bar/2),Math.min(zero,yy),earningsShowEstimates?bar:bar*1.5,Math.max(2,Math.abs(zero-yy)));} if(earningsShowEstimates&&Number.isFinite(estimate)){const yy=y(estimate);ctx.fillStyle="#d6aa4b";ctx.fillRect(xx+2,Math.min(zero,yy),bar,Math.max(2,Math.abs(zero-yy)));} ctx.fillStyle="#8f98aa";ctx.textAlign="center";ctx.fillText(String(row.period||`${row.year||""} Q${row.quarter||""}`).replace(/^\d{4}-/,""),xx,h-12); });
-  enableChartCrosshair(document.getElementById("earnings-chart"), drawEarningsChart, pad, ratio => { const index=Math.max(0,Math.min(rows.length-1,Math.round(ratio*(rows.length-1)))),row=rows[index]; return `<span>${escapeHtml(String(row.period||`${row.year||""} Q${row.quarter||""}`))}</span><b>Actual EPS ${fmt(Number(row.actual))}</b>${earningsShowEstimates ? `<em>Estimate ${fmt(Number(row.estimate))}</em><em>Surprise ${Number.isFinite(Number(row.surprise))?Number(row.surprise).toFixed(2):"N/A"}</em>` : `<em>Estimate hidden</em>`}`; });
+  for (let i = 0; i < 4; i++) { const value = max - i * span / 3, yy = y(value); ctx.strokeStyle = "rgba(148,163,184,.12)"; ctx.setLineDash([3,5]); ctx.beginPath(); ctx.moveTo(pad.left,yy); ctx.lineTo(w-pad.right,yy); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle="#8f98aa"; ctx.textAlign="right"; ctx.fillText(`${value.toFixed(earningsView === "revenue" ? 1 : 2)}${earningsView === "revenue" ? "%" : ""}`,pad.left-7,yy+3); }
+  rows.forEach((row,index) => {
+    const xx=pad.left+group*(index+.5), zero=y(0);
+    if (earningsView === "revenue") {
+      const growth=Number(row.revenueGrowthYoY), yy=y(growth); ctx.fillStyle=growth>=0?"#35d19f":"#ef6b78"; ctx.fillRect(xx-bar*.75,Math.min(zero,yy),bar*1.5,Math.max(2,Math.abs(zero-yy)));
+    } else {
+      const actual=Number(row.actual), estimate=Number(row.estimate);
+      if(Number.isFinite(actual)){const yy=y(actual);ctx.fillStyle="#5999e0";ctx.fillRect(xx-(earningsShowEstimates?bar+2:bar/2),Math.min(zero,yy),earningsShowEstimates?bar:bar*1.5,Math.max(2,Math.abs(zero-yy)));}
+      if(earningsShowEstimates&&Number.isFinite(estimate)){const yy=y(estimate);ctx.fillStyle="#d6aa4b";ctx.fillRect(xx+2,Math.min(zero,yy),bar,Math.max(2,Math.abs(zero-yy)));}
+    }
+    ctx.fillStyle="#8f98aa";ctx.textAlign="center";ctx.fillText(earningsPeriodLabel(row),xx,h-12);
+  });
+  enableChartCrosshair(document.getElementById("earnings-chart"), drawEarningsChart, pad, ratio => {
+    const index=Math.max(0,Math.min(rows.length-1,Math.round(ratio*(rows.length-1)))),row=rows[index];
+    return earningsView === "revenue"
+      ? `<span>${escapeHtml(earningsPeriodLabel(row))}</span><b>Revenue ${isFiniteValue(row.revenue) ? `$${compactNumber(Number(row.revenue))}` : "N/A"}</b><em>YoY growth ${isFiniteValue(row.revenueGrowthYoY) ? `${Number(row.revenueGrowthYoY).toFixed(1)}%` : "N/A"}</em>`
+      : `<span>${escapeHtml(earningsPeriodLabel(row))}</span><b>Actual EPS ${fmt(row.actual)}</b>${earningsShowEstimates ? `<em>Estimate ${fmt(row.estimate)}</em><em>Surprise ${isFiniteValue(row.surprise)?Number(row.surprise).toFixed(2):"N/A"}</em>` : `<em>Estimate hidden</em>`}`;
+  });
 }
 
 function drawMacroIndicators() {
@@ -2587,13 +2621,6 @@ document.addEventListener("click", (event) => {
 
   const chatPrompt = event.target.closest("[data-chat-prompt]");
   if (chatPrompt) sendChatMessage(chatPrompt.dataset.chatPrompt);
-
-  const earningsButton = event.target.closest("[data-earnings-mode]");
-  if (earningsButton) {
-    const group = earningsButton.dataset.earningsMode;
-    earningsButton.parentElement.querySelectorAll(`[data-earnings-mode="${group}"]`).forEach(button => button.classList.remove("active"));
-    earningsButton.classList.add("active");
-  }
 
   if (event.target.closest("button, input, label, a")) return;
   const detail = event.target.closest("[data-detail]");

@@ -236,6 +236,7 @@ button.active { background: rgba(54, 211, 153, 0.16); border-color: rgba(54, 211
 .earnings-legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
 .earnings-legend .actual::before { background: #5999e0; }
 .earnings-legend .estimate::before { background: #d6aa4b; }
+.earnings-legend .revenue::before { background: #35d19f; }
 .earnings-legend strong { margin-left: auto; color: var(--soft); font-weight: 600; }
 .earnings-chart { height: 250px; border-color: rgba(255,255,255,.08); background: #0b1220; }
 .earnings-values { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 8px; margin-top: 10px; }

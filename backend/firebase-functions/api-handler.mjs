@@ -476,6 +476,7 @@ async function alphaVantageOverview(env, symbol) {
     metrics: { metric: {
       epsTTM: Number(overview.EPS),
       epsGrowthYoY: Number(overview.QuarterlyEarningsGrowthYOY) * 100,
+      revenueGrowthYoY: Number(overview.QuarterlyRevenueGrowthYOY) * 100,
       peTTM: Number(overview.PERatio),
       revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : Number(overview.RevenuePerShareTTM),
       "52WeekHigh": Number(overview["52WeekHigh"]),
@@ -485,22 +486,40 @@ async function alphaVantageOverview(env, symbol) {
 }
 
 async function alphaVantageEarnings(env, symbol) {
-  const data = await alphaVantage(env, { function: "EARNINGS", symbol: alphaVantageSymbol(symbol) });
+  const sourceSymbol = alphaVantageSymbol(symbol);
+  const [data, income] = await Promise.all([
+    alphaVantage(env, { function: "EARNINGS", symbol: sourceSymbol }),
+    alphaVantage(env, { function: "INCOME_STATEMENT", symbol: sourceSymbol })
+  ]);
   const rows = Array.isArray(data.quarterlyEarnings) ? data.quarterlyEarnings : [];
   if (!rows.length) throw new Error("Alpha Vantage returned no earnings records");
+  const revenues = (Array.isArray(income.quarterlyReports) ? income.quarterlyReports : []).map(row => ({
+    time: Date.parse(`${row.fiscalDateEnding}T00:00:00Z`),
+    revenue: Number(row.totalRevenue)
+  })).filter(row => Number.isFinite(row.time) && Number.isFinite(row.revenue) && row.revenue >= 0);
+  if (!revenues.length) throw new Error("Alpha Vantage returned no quarterly revenue records");
   return rows.slice(0, 12).map(row => {
     const date = new Date(`${row.fiscalDateEnding}T00:00:00Z`);
     const quarter = Math.floor(date.getUTCMonth() / 3) + 1;
     const actual = Number(row.reportedEPS);
     const estimate = Number(row.estimatedEPS);
+    const time = date.getTime();
+    const revenueRow = revenues.reduce((best, item) => Math.abs(item.time - time) < Math.abs((best?.time ?? Infinity) - time) ? item : best, null);
+    const priorRevenue = revenues.filter(item => { const days = (time - item.time) / 86400000; return days >= 300 && days <= 430; }).reduce((best, item) => Math.abs((time - item.time) / 86400000 - 365.25) < Math.abs((time - (best?.time ?? -Infinity)) / 86400000 - 365.25) ? item : best, null);
+    const revenue = revenueRow && Math.abs(revenueRow.time - time) <= 75 * 86400000 ? revenueRow.revenue : null;
     return {
       symbol,
       year: date.getUTCFullYear(),
       quarter,
-      period: `${date.getUTCFullYear()} Q${quarter}`,
+      period: row.fiscalDateEnding,
+      fiscalDateEnding: row.fiscalDateEnding,
+      reportedDate: row.reportedDate || null,
       actual,
       estimate,
-      surprise: Number.isFinite(actual) && Number.isFinite(estimate) ? actual - estimate : Number(row.surprise)
+      surprise: Number.isFinite(actual) && Number.isFinite(estimate) ? actual - estimate : Number(row.surprise),
+      revenue,
+      revenueGrowthYoY: Number.isFinite(revenue) && Number.isFinite(priorRevenue?.revenue) && priorRevenue.revenue !== 0 ? (revenue / priorRevenue.revenue - 1) * 100 : null,
+      provider: "Alpha Vantage"
     };
   });
 }
@@ -524,17 +543,6 @@ async function alphaVantageNews(env, symbol) {
     url: story.url || "#",
     summary: story.summary || ""
   }));
-}
-
-function demoEarnings(symbol) {
-  return Array.from({ length: 8 }, (_, index) => {
-    const date = new Date();
-    date.setMonth(date.getMonth() - (7 - index) * 3);
-    const quarter = Math.floor(date.getMonth() / 3) + 1;
-    const actual = 1 + (seed(symbol) % 220) / 100 + index * 0.08;
-    const estimate = actual - 0.05 + ((index % 3) - 1) * 0.03;
-    return { symbol, year: date.getFullYear(), quarter, period: `${date.getFullYear()} Q${quarter}`, actual, estimate, surprise: actual - estimate };
-  }).reverse();
 }
 
 const demoNews = symbol => [
@@ -814,12 +822,38 @@ async function yahooFundamentals(symbol, retry = true) {
     metrics: { metric: {
       epsTTM: yahooRawNumber(statistics.trailingEps),
       epsGrowthYoY: Number.isFinite(yahooRawNumber(financial.earningsGrowth)) ? yahooRawNumber(financial.earningsGrowth) * 100 : null,
+      revenueGrowthYoY: Number.isFinite(yahooRawNumber(financial.revenueGrowth)) ? yahooRawNumber(financial.revenueGrowth) * 100 : null,
       peTTM: yahooRawNumber(summary.trailingPE),
       revenuePerShareTTM: Number.isFinite(revenue) && Number.isFinite(shares) && shares > 0 ? revenue / shares : yahooRawNumber(financial.revenuePerShare),
       "52WeekHigh": yahooRawNumber(summary.fiftyTwoWeekHigh),
       "52WeekLow": yahooRawNumber(summary.fiftyTwoWeekLow)
     } }
   };
+}
+
+async function yahooEarnings(symbol, retry = true) {
+  const session = await yahooSession();
+  const url = new URL(`https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}`);
+  url.searchParams.set("modules", "earningsHistory,incomeStatementHistoryQuarterly,financialData");
+  url.searchParams.set("crumb", session.crumb);
+  const response = await fetch(url, { headers: { Accept: "application/json", Cookie: session.cookie, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36" } });
+  const payload = await response.json().catch(() => ({}));
+  const errorMessage = payload?.quoteSummary?.error?.description || payload?.finance?.error?.description || "";
+  if (retry && (response.status === 401 || /crumb|unauthorized/i.test(errorMessage))) { await yahooSession(true); return yahooEarnings(symbol, false); }
+  if (!response.ok) throw new Error(errorMessage || `Yahoo earnings request failed (${response.status})`);
+  const result = payload?.quoteSummary?.result?.[0];
+  const history = [...(result?.earningsHistory?.history || [])].sort((a, b) => yahooRawNumber(b.quarter) - yahooRawNumber(a.quarter));
+  const statements = result?.incomeStatementHistoryQuarterly?.incomeStatementHistory || [];
+  if (!Array.isArray(history) || !history.length) throw new Error("Yahoo Finance returned no earnings history");
+  const revenues = statements.map(row => ({ time: yahooRawNumber(row.endDate) * 1000, revenue: yahooRawNumber(row.totalRevenue) })).filter(row => Number.isFinite(row.time) && Number.isFinite(row.revenue) && row.revenue >= 0);
+  const latestRevenueGrowth = Number.isFinite(yahooRawNumber(result?.financialData?.revenueGrowth)) ? yahooRawNumber(result.financialData.revenueGrowth) * 100 : null;
+  return history.slice(0, 12).map((row, index) => {
+    const date = new Date(yahooRawNumber(row.quarter) * 1000), time = date.getTime();
+    const revenueRow = revenues.reduce((best, item) => Math.abs(item.time - time) < Math.abs((best?.time ?? Infinity) - time) ? item : best, null);
+    const priorRevenue = revenues.filter(item => { const days = (time - item.time) / 86400000; return days >= 300 && days <= 430; }).reduce((best, item) => Math.abs((time - item.time) / 86400000 - 365.25) < Math.abs((time - (best?.time ?? -Infinity)) / 86400000 - 365.25) ? item : best, null);
+    const revenue = revenueRow && Math.abs(revenueRow.time - time) <= 75 * 86400000 ? revenueRow.revenue : null;
+    return { symbol, year: date.getUTCFullYear(), quarter: Math.floor(date.getUTCMonth() / 3) + 1, period: date.toISOString().slice(0, 10), fiscalDateEnding: date.toISOString().slice(0, 10), reportedDate: null, actual: yahooRawNumber(row.epsActual), estimate: yahooRawNumber(row.epsEstimate), surprise: yahooRawNumber(row.epsDifference), revenue, revenueGrowthYoY: Number.isFinite(revenue) && Number.isFinite(priorRevenue?.revenue) && priorRevenue.revenue !== 0 ? (revenue / priorRevenue.revenue - 1) * 100 : index === 0 ? latestRevenueGrowth : null, revenueGrowthBasis: Number.isFinite(priorRevenue?.revenue) ? "Quarterly YoY" : index === 0 && Number.isFinite(latestRevenueGrowth) ? "Latest provider YoY" : null, provider: "Yahoo Finance" };
+  });
 }
 
 async function yahooOptions(symbol, expiration, retry = true) {
@@ -931,7 +965,8 @@ async function stockPayload(env, url) {
   let profile = { name: symbol, exchange: null, sector: null, industry: null, finnhubIndustry: null, marketCapitalization: null, shareOutstanding: null };
   let metrics = { metric: {} };
   let fundamentalsProvider = "Unavailable";
-  let earnings = demoEarnings(symbol);
+  let earnings = [];
+  let earningsProvider = "Unavailable";
   let news = demoNews(symbol);
   const diagnostics = [];
   try {
@@ -971,11 +1006,16 @@ async function stockPayload(env, url) {
       diagnostics.push({ provider: "Yahoo Finance fundamentals", ok: false, authApplied: false, message: fallbackError.message });
     }
   }
-  try { earnings = await alphaVantageEarnings(env, symbol); } catch {}
+  try { earnings = await alphaVantageEarnings(env, symbol); earningsProvider = "Alpha Vantage"; }
+  catch (error) {
+    diagnostics.push({ provider: "Alpha Vantage earnings", ok: false, authApplied: Boolean(alphaVantageKey(env)), message: error.message });
+    try { earnings = await yahooEarnings(symbol); earningsProvider = "Yahoo Finance"; diagnostics.push({ provider: "Yahoo Finance earnings", ok: true, authApplied: false, message: "Reported EPS, estimates, and quarterly revenue returned" }); }
+    catch (fallbackError) { diagnostics.push({ provider: "Yahoo Finance earnings", ok: false, authApplied: false, message: fallbackError.message }); }
+  }
   try { news = await alphaVantageNews(env, symbol); } catch {}
   let probabilityCandles = candles;
   try { probabilityCandles = (await marketChart(env, symbol, "5Y")).candles; } catch {}
-  return json({ configured: true, provider: candles.provider || "Market data", fetchedAt: new Date().toISOString(), symbol, range, resolution: candles.resolution, quoteProvider: quote.provider, candleProvider: candles.provider, fundamentalsProvider, dataDiagnostics: diagnostics, quote, profile, metrics, candles, probabilityCandles, earnings, news, sentiment: { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 }, recommendations: [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }] });
+  return json({ configured: true, provider: candles.provider || "Market data", fetchedAt: new Date().toISOString(), symbol, range, resolution: candles.resolution, quoteProvider: quote.provider, candleProvider: candles.provider, fundamentalsProvider, earningsProvider, dataDiagnostics: diagnostics, quote, profile, metrics, candles, probabilityCandles, earnings, news, sentiment: { provider: "Demo fallback (offline)", bullishPercent: 52, bearishPercent: 28 }, recommendations: [{ symbol, buy: 8, hold: 11, sell: 2, strongBuy: 4, strongSell: 1, period: new Date().toISOString().slice(0, 7) }] });
 }
 
 export async function handleApi(context) {
